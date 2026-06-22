@@ -17,19 +17,12 @@ SSH hop — including a proxy-jump) and lets you browse and act on:
 go build -o ds9s .
 ```
 
-Requires Go 1.22+. Dependencies are vendored (`vendor/`), so this builds
-fully offline:
+Requires Go 1.22+ and normal internet access (to fetch modules):
 
 ```bash
-go build -mod=vendor -o ds9s .
+go mod tidy   # only needed once, to (re)generate go.sum on your machine
+go build -o ds9s .
 ```
-
-The `go.mod` still carries a few `replace` lines pointing `golang.org/x/...`
-and `gopkg.in/yaml.v3` at GitHub mirrors — only needed because the sandbox
-that generated this project had no access to `proxy.golang.org`/`golang.org`.
-They're harmless to keep (the `vendor/` directory is what actually gets
-built from), but on a machine with full internet access you can drop them
-and run `go mod tidy` if you'd rather track canonical upstream versions.
 
 ## Configure
 

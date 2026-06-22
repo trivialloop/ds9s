@@ -28,27 +28,3 @@ require (
 	golang.org/x/term v0.28.0 // indirect
 	golang.org/x/text v0.21.0 // indirect
 )
-
-replace golang.org/x/text => github.com/golang/text v0.21.0
-
-replace golang.org/x/sys => github.com/golang/sys v0.29.0
-
-replace golang.org/x/term => github.com/golang/term v0.28.0
-
-replace golang.org/x/crypto => github.com/golang/crypto v0.31.0
-
-replace gopkg.in/yaml.v3 => /home/claude/vendor-yaml
-
-replace golang.org/x/tools => github.com/golang/tools v0.21.0
-
-replace golang.org/x/mod => github.com/golang/mod v0.17.0
-
-replace golang.org/x/sync => github.com/golang/sync v0.10.0
-
-replace golang.org/x/net => github.com/golang/net v0.33.0
-
-replace golang.org/x/image => github.com/golang/image v0.23.0
-
-replace golang.org/x/telemetry => github.com/golang/telemetry v0.0.0-20240228155512-f48c80bd79b2
-
-replace golang.org/x/exp => github.com/golang/exp v0.0.0-20240613232115-7f521ea00fb8
