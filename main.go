@@ -9,12 +9,21 @@ import (
 	"ds9s/internal/ui"
 )
 
+// version is injected at build time via -ldflags "-X main.version=vX.Y.Z".
+var version = "dev"
+
 func main() {
 	var (
-		configPath = flag.String("config", "", "path to ds9s config file (default: ~/.config/ds9s/config.yaml)")
-		manager    = flag.String("manager", "", "name of the manager to connect to (overrides config's 'current')")
+		configPath  = flag.String("config", "", "path to ds9s config file (default: ~/.config/ds9s/config.yaml)")
+		manager     = flag.String("manager", "", "name of the manager to connect to (overrides config's 'current')")
+		showVersion = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("ds9s", version)
+		return
+	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {

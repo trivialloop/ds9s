@@ -1,0 +1,63 @@
+name: release
+
+# Triggered by a manual tag push: git tag v1.2.3 && git push origin v1.2.3
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # needed to create GitHub releases and upload assets
+
+jobs:
+  release:
+    name: Build & publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so --generate-notes spans all commits
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod   # honours the `go` directive in go.mod
+
+      - name: Verify go.mod/go.sum are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Build binaries
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          LDFLAGS="-s -w -X main.version=${VERSION}"
+          mkdir -p dist
+
+          for OS in linux darwin; do
+            for ARCH in amd64 arm64; do
+              OUT="dist/ds9s-${OS}-${ARCH}"
+              echo "Building ${OUT}…"
+              GOOS=${OS} GOARCH=${ARCH} go build -ldflags "${LDFLAGS}" -o "${OUT}" .
+            done
+          done
+
+          # Windows convenience build
+          GOOS=windows GOARCH=amd64 go build \
+            -ldflags "${LDFLAGS}" \
+            -o dist/ds9s-windows-amd64.exe .
+
+          ls -lh dist/
+
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "ds9s ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/ds9s-linux-amd64 \
+            dist/ds9s-linux-arm64 \
+            dist/ds9s-darwin-amd64 \
+            dist/ds9s-darwin-arm64 \
+            dist/ds9s-windows-amd64.exe

@@ -2,6 +2,7 @@ package dockerx
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -11,6 +12,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
+	"golang.org/x/term"
 
 	"ds9s/internal/config"
 )
@@ -294,4 +296,186 @@ func filepath_join(home, rest string) string {
 		return home
 	}
 	return home + string(os.PathSeparator) + rest
+}
+
+// splitHostPort splits "host:port" → (host, port).
+// Returns (addr, "") when no port separator is found.
+// Handles IPv6 literals like "[::1]:22".
+func splitHostPort(addr string) (host, port string) {
+	for i := len(addr) - 1; i >= 0; i-- {
+		if addr[i] == ':' {
+			return addr[:i], addr[i+1:]
+		}
+		if addr[i] == ']' {
+			// IPv6 literal with no port suffix
+			break
+		}
+	}
+	return addr, ""
+}
+
+// newSSHClientToNode creates an SSH client to nodeAddr using the same
+// credentials as the manager (same user, key, proxyJump). nodeAddr may be
+// "host" or "host:port"; when no port is given the manager's SSH port is
+// reused (default 22). The returned cleanup func must be called when done —
+// it closes both the node client and any intermediate jump-host client.
+func newSSHClientToNode(cfg config.SSHConfig, nodeAddr string) (*ssh.Client, func(), error) {
+	authMethods, err := sshAuthMethods(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	hostKeyCallback, err := sshHostKeyCallback(cfg.KnownHosts)
+	if err != nil {
+		return nil, nil, err
+	}
+	clientConfig := &ssh.ClientConfig{
+		User:            cfg.User,
+		Auth:            authMethods,
+		HostKeyCallback: hostKeyCallback,
+		Timeout:         10 * time.Second,
+	}
+
+	host, port := splitHostPort(nodeAddr)
+	if port == "" {
+		_, mgrPort := splitHostPort(cfg.Addr)
+		if mgrPort == "" {
+			mgrPort = "22"
+		}
+		port = mgrPort
+	}
+	target := net.JoinHostPort(host, port)
+
+	if cfg.ProxyJump != "" {
+		pjHost, pjPort := splitHostPort(cfg.ProxyJump)
+		if pjPort == "" {
+			pjPort = "22"
+		}
+		jumpAddr := net.JoinHostPort(pjHost, pjPort)
+
+		jumpClient, err := ssh.Dial("tcp", jumpAddr, clientConfig)
+		if err != nil {
+			return nil, nil, fmt.Errorf("proxy-jump %s: %w", jumpAddr, err)
+		}
+		conn, err := jumpClient.Dial("tcp", target)
+		if err != nil {
+			_ = jumpClient.Close()
+			return nil, nil, fmt.Errorf("proxy-jump %s → %s: %w", jumpAddr, target, err)
+		}
+		sshConn, chans, reqs, err := ssh.NewClientConn(conn, target, clientConfig)
+		if err != nil {
+			_ = conn.Close()
+			_ = jumpClient.Close()
+			return nil, nil, fmt.Errorf("ssh handshake via proxy to %s: %w", target, err)
+		}
+		client := ssh.NewClient(sshConn, chans, reqs)
+		return client, func() { _ = client.Close(); _ = jumpClient.Close() }, nil
+	}
+
+	conn, err := net.DialTimeout("tcp", target, 10*time.Second)
+	if err != nil {
+		return nil, nil, fmt.Errorf("dialing %s: %w", target, err)
+	}
+	sshConn, chans, reqs, err := ssh.NewClientConn(conn, target, clientConfig)
+	if err != nil {
+		_ = conn.Close()
+		return nil, nil, fmt.Errorf("ssh handshake with %s: %w", target, err)
+	}
+	client := ssh.NewClient(sshConn, chans, reqs)
+	return client, func() { _ = client.Close() }, nil
+}
+
+// RunCommandOnNode SSHes to nodeAddr using cfg's credentials and runs cmd,
+// returning its stdout. Stderr is appended to the error when the command fails.
+// The caller is responsible for sudo-prefixing cmd if needed.
+func RunCommandOnNode(cfg config.SSHConfig, nodeAddr, cmd string) (string, error) {
+	client, cleanup, err := newSSHClientToNode(cfg, nodeAddr)
+	if err != nil {
+		return "", err
+	}
+	defer cleanup()
+
+	session, err := client.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("ssh session: %w", err)
+	}
+	defer session.Close()
+
+	var stdout, stderr bytes.Buffer
+	session.Stdout = &stdout
+	session.Stderr = &stderr
+	if err := session.Run(cmd); err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return "", fmt.Errorf("%w\n%s", err, msg)
+		}
+		return "", err
+	}
+	return stdout.String(), nil
+}
+
+// ShellInContainer opens an interactive /bin/sh inside the given container
+// running on nodeAddr via SSH with PTY allocation. The local terminal is
+// put into raw mode for the session's duration.
+// Call this from inside a tv.Suspend() closure so the TUI is not competing
+// for stdin/stdout.
+// Exit codes 0, 1, and 130 (Ctrl-C) are treated as normal and return nil.
+func ShellInContainer(cfg config.SSHConfig, nodeAddr, containerID string) error {
+	client, cleanup, err := newSSHClientToNode(cfg, nodeAddr)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	session, err := client.NewSession()
+	if err != nil {
+		return fmt.Errorf("ssh session: %w", err)
+	}
+	defer session.Close()
+
+	fd := int(os.Stdin.Fd())
+	w, h, sizeErr := term.GetSize(fd)
+	if sizeErr != nil {
+		w, h = 80, 24
+	}
+
+	termName := os.Getenv("TERM")
+	if termName == "" {
+		termName = "xterm-256color"
+	}
+
+	modes := ssh.TerminalModes{
+		ssh.ECHO:          1,
+		ssh.TTY_OP_ISPEED: 14400,
+		ssh.TTY_OP_OSPEED: 14400,
+	}
+	if err := session.RequestPty(termName, h, w, modes); err != nil {
+		return fmt.Errorf("pty request: %w", err)
+	}
+
+	// Raw mode: forward keystrokes immediately instead of buffering until newline.
+	oldState, rawErr := term.MakeRaw(fd)
+	if rawErr == nil {
+		defer term.Restore(fd, oldState)
+	}
+
+	session.Stdin = os.Stdin
+	session.Stdout = os.Stdout
+	session.Stderr = os.Stderr
+
+	dockerCmd := "docker exec -it " + containerID + " /bin/sh"
+	if cfg.Sudo {
+		dockerCmd = "sudo -n " + dockerCmd
+	}
+
+	runErr := session.Run(dockerCmd)
+	if runErr == nil {
+		return nil
+	}
+	var exitErr *ssh.ExitError
+	if errors.As(runErr, &exitErr) {
+		switch exitErr.ExitStatus() {
+		case 0, 1, 130:
+			return nil
+		}
+	}
+	return runErr
 }

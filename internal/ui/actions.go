@@ -6,12 +6,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"os/exec"
 	"strconv"
 
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/swarm"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+
+	"ds9s/internal/dockerx"
 )
 
 // confirm shows a yes/no modal and runs onYes if the user confirms.
@@ -131,6 +136,10 @@ func (a *App) handleDelete() {
 			err = a.store.RemoveConfig(ctx, ref.id)
 		case viewSecrets:
 			err = a.store.RemoveSecret(ctx, ref.id)
+		case viewVolumes:
+			err = a.store.RemoveVolume(ctx, ref.id, false)
+		case viewNetworks:
+			err = a.store.RemoveNetwork(ctx, ref.id)
 		default:
 			err = fmt.Errorf("delete not supported for %s", ref.kind)
 		}
@@ -219,6 +228,10 @@ func (a *App) handleDescribe() {
 	case viewStacks:
 		a.setStatus("[yellow]describe a service within the stack instead")
 		return
+	case viewVolumes:
+		data, _, err = a.conn.Client.VolumeInspectWithRaw(ctx, ref.id)
+	case viewNetworks:
+		data, _, err = a.conn.Client.NetworkInspectWithRaw(ctx, ref.id, types.NetworkInspectOptions{})
 	}
 	if err != nil {
 		a.setStatus(fmt.Sprintf("[red]%v", err))
@@ -487,12 +500,245 @@ func (a *App) handleEnter() {
 	}
 	switch ref.kind {
 	case viewStacks:
-		// Drill into services filtered by this stack.
 		a.switchView(viewServices)
 	case viewServices, viewContainers:
-		// Default action for services/tasks is to show logs.
 		a.handleLogs()
 	default:
 		a.handleDescribe()
 	}
+}
+
+// --- Edit (service spec / stack sub-menu) ------------------------------------
+
+func (a *App) handleEdit() {
+	ref := a.selectedRow()
+	if ref == nil {
+		return
+	}
+	switch ref.kind {
+	case viewServices:
+		a.editService(ref.id, ref.name)
+	case viewStacks:
+		a.showStackEditMenu(ref.name)
+	default:
+		a.setStatus(fmt.Sprintf("[yellow]edit (e) not supported for %s", ref.kind))
+	}
+}
+
+// editService opens the service spec JSON in $EDITOR (suspending the TUI),
+// then applies the edited spec back to the Swarm manager on save.
+func (a *App) editService(serviceID, serviceName string) {
+	ctx, cancel := a.ctx()
+	svc, err := a.store.ServiceSpec(ctx, serviceID)
+	cancel()
+	if err != nil {
+		a.setStatus(fmt.Sprintf("[red]inspect service: %v", err))
+		return
+	}
+
+	specJSON, err := json.MarshalIndent(svc.Spec, "", "  ")
+	if err != nil {
+		a.setStatus(fmt.Sprintf("[red]marshal spec: %v", err))
+		return
+	}
+
+	tmpFile, err := os.CreateTemp("", "ds9s-edit-*.json")
+	if err != nil {
+		a.setStatus(fmt.Sprintf("[red]create temp file: %v", err))
+		return
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := tmpFile.Write(specJSON); err != nil {
+		tmpFile.Close()
+		a.setStatus(fmt.Sprintf("[red]write temp file: %v", err))
+		return
+	}
+	tmpFile.Close()
+
+	original := string(specJSON)
+
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = os.Getenv("VISUAL")
+	}
+	if editor == "" {
+		editor = "vi"
+	}
+
+	var editErr error
+	a.tv.Suspend(func() {
+		cmd := exec.Command(editor, tmpPath)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		editErr = cmd.Run()
+	})
+	if editErr != nil {
+		a.setStatus(fmt.Sprintf("[red]editor exited with error: %v", editErr))
+		return
+	}
+
+	edited, err := os.ReadFile(tmpPath)
+	if err != nil {
+		a.setStatus(fmt.Sprintf("[red]reading edited file: %v", err))
+		return
+	}
+	if string(edited) == original {
+		a.setStatus("[yellow]no changes — service not updated")
+		return
+	}
+
+	var newSpec swarm.ServiceSpec
+	if err := json.Unmarshal(edited, &newSpec); err != nil {
+		a.setStatus(fmt.Sprintf("[red]invalid JSON after edit: %v", err))
+		return
+	}
+
+	ctx2, cancel2 := a.ctx()
+	err = a.store.ServiceUpdateSpec(ctx2, serviceID, svc.Version, newSpec)
+	cancel2()
+	if err != nil {
+		a.setStatus(fmt.Sprintf("[red]update failed: %v", err))
+		return
+	}
+	a.setStatus(fmt.Sprintf("[green]service %s updated", serviceName))
+	_ = a.refreshCurrent()
+}
+
+// showStackEditMenu presents a list of services in the stack; the selected
+// service is then opened in editService.
+func (a *App) showStackEditMenu(stackName string) {
+	ctx, cancel := a.ctx()
+	services, err := a.store.ServicesInStack(ctx, stackName)
+	cancel()
+	if err != nil {
+		a.setStatus(fmt.Sprintf("[red]%v", err))
+		return
+	}
+	if len(services) == 0 {
+		a.setStatus(fmt.Sprintf("[yellow]no services in stack %s", stackName))
+		return
+	}
+
+	list := tview.NewList().ShowSecondaryText(false)
+	for _, svc := range services {
+		svc := svc
+		list.AddItem(svc.Spec.Name, "", 0, func() {
+			a.pages.RemovePage("stack-edit")
+			a.tv.SetFocus(a.table)
+			a.editService(svc.ID, svc.Spec.Name)
+		})
+	}
+	list.SetBorder(true).SetTitle(fmt.Sprintf(" Edit service in [%s] — ↑↓ navigate · Enter select · Esc cancel ", stackName))
+	list.SetDoneFunc(func() {
+		a.pages.RemovePage("stack-edit")
+		a.tv.SetFocus(a.table)
+	})
+	a.pages.AddPage("stack-edit", list, true, true)
+	a.tv.SetFocus(list)
+}
+
+// --- Shell exec (s on containers view) ---------------------------------------
+
+// handleShell opens an interactive /bin/sh inside the selected container.
+// For SSH-connected managers the shell is opened via Go crypto/ssh directly
+// (no system ssh binary — no agent key flooding, proper PTY raw mode).
+// The TUI is suspended while the shell session is active.
+func (a *App) handleShell() {
+	ref := a.selectedRow()
+	if ref == nil || ref.kind != viewContainers {
+		return
+	}
+	if ref.containerID == "" {
+		a.setStatus("[red]container ID not available (task not yet started)")
+		return
+	}
+
+	// Use nodeAddr (Swarm advertise IP) as the SSH target — more reliable than
+	// the OS hostname which may not be resolvable from outside the cluster.
+	sshTarget := ref.nodeAddr
+	if sshTarget == "" {
+		sshTarget = ref.nodeName
+	}
+
+	a.setStatus(fmt.Sprintf("Opening shell in %s on %s…", ref.containerID[:min(12, len(ref.containerID))], sshTarget))
+
+	var shellErr error
+	a.tv.Suspend(func() {
+		// Clear the screen so the shell starts on a clean terminal instead of
+		// showing whatever was behind the ds9s TUI.
+		fmt.Print("\033[H\033[2J\033[3J")
+
+		if a.conn.Manager.SSH != nil {
+			shellErr = dockerx.ShellInContainer(*a.conn.Manager.SSH, sshTarget, ref.containerID)
+		} else {
+			// Local docker exec (manager socket, no SSH).
+			cmd := exec.Command("docker", "exec", "-it", ref.containerID, "/bin/sh")
+			cmd.Stdin = os.Stdin
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			err := cmd.Run()
+			if err != nil && err.Error() != "exit status 1" && err.Error() != "exit status 130" {
+				shellErr = err
+			}
+		}
+	})
+	if shellErr != nil {
+		a.setStatus(fmt.Sprintf("[yellow]shell exited: %v", shellErr))
+	} else {
+		a.setStatus("Shell session ended.")
+	}
+}
+
+// --- Kill container (k on containers view) -----------------------------------
+
+func (a *App) handleKill() {
+	ref := a.selectedRow()
+	if ref == nil || ref.kind != viewContainers {
+		return
+	}
+	if ref.containerID == "" {
+		a.setStatus("[red]container ID not available")
+		return
+	}
+	// Use Swarm advertise IP (nodeAddr) — more reliable for SSH than OS hostname.
+	sshTarget := ref.nodeAddr
+	if sshTarget == "" {
+		sshTarget = ref.nodeName
+	}
+	a.confirm(fmt.Sprintf("Kill container %q with SIGKILL?\n(Swarm will restart it automatically)", ref.name), func() {
+		a.setStatus(fmt.Sprintf("Killing %s on %s…", ref.containerID[:min(12, len(ref.containerID))], sshTarget))
+		go a.doKill(ref.containerID, sshTarget, ref.name)
+	})
+}
+
+func (a *App) doKill(containerID, sshTarget, displayName string) {
+	var killErr error
+
+	if a.conn.Manager.SSH != nil && sshTarget != "" {
+		remoteKill := "docker kill " + containerID
+		if a.conn.Manager.SSH.Sudo {
+			remoteKill = "sudo -n " + remoteKill
+		}
+		_, killErr = dockerx.RunCommandOnNode(*a.conn.Manager.SSH, sshTarget, remoteKill)
+	} else {
+		// Local Docker API — works only if container is on the manager node.
+		ctx, cancel := a.ctx()
+		defer cancel()
+		killErr = a.store.KillContainer(ctx, containerID)
+	}
+
+	a.tv.QueueUpdateDraw(func() {
+		if killErr != nil {
+			// Show the error in a dismissible page — it would be overwritten by the
+			// auto-refresh status if we only used setStatus().
+			msg := fmt.Sprintf("[red]Kill failed for %s on %s[-]\n\n%v\n\n[grey]Press Esc or Enter to dismiss[-]",
+				displayName, sshTarget, killErr)
+			a.showInfoPage("kill-error", " Kill Error ", msg)
+		} else {
+			a.setStatus(fmt.Sprintf("[green]killed %s", displayName))
+		}
+	})
 }

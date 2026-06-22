@@ -27,6 +27,8 @@ const (
 	viewNodes      viewName = "nodes"
 	viewConfigs    viewName = "configs"
 	viewSecrets    viewName = "secrets"
+	viewVolumes    viewName = "volumes"
+	viewNetworks   viewName = "networks"
 )
 
 // aliases lets users type short forms in the command bar, k9s-style.
@@ -37,6 +39,8 @@ var aliases = map[string]viewName{
 	"node": viewNodes, "nodes": viewNodes, "no": viewNodes,
 	"config": viewConfigs, "configs": viewConfigs, "cm": viewConfigs,
 	"secret": viewSecrets, "secrets": viewSecrets, "sec": viewSecrets,
+	"volume": viewVolumes, "volumes": viewVolumes, "vol": viewVolumes, "pv": viewVolumes,
+	"network": viewNetworks, "networks": viewNetworks, "net": viewNetworks, "ns": viewNetworks,
 }
 
 // App owns the whole UI: the tview application, layout primitives, the
@@ -137,6 +141,8 @@ func (a *App) build() {
 			"nodes", "node", "no",
 			"configs", "config", "cm",
 			"secrets", "secret", "sec",
+			"volumes", "volume", "vol", "pv",
+			"networks", "network", "net", "ns",
 			"alias", "aliases",
 			"context", "ctx",
 			"quit", "q", "exit",
@@ -192,6 +198,11 @@ func (a *App) pollLoop() {
 	for {
 		select {
 		case <-ticker.C:
+			// Skip auto-poll for views that require SSH to every node —
+			// those only refresh on demand (press r).
+			if a.current == viewVolumes || a.current == viewNetworks {
+				continue
+			}
 			a.tv.QueueUpdateDraw(func() {
 				if err := a.refreshCurrent(); err != nil {
 					a.setStatus(fmt.Sprintf("[red]%v", err))
@@ -239,13 +250,24 @@ func (a *App) globalKeys(event *tcell.EventKey) *tcell.EventKey {
 		a.handleLogs()
 		return nil
 	case 's':
-		a.handleScale()
+		// Contextual: scale on services, shell exec on containers.
+		if a.current == viewContainers {
+			a.handleShell()
+		} else {
+			a.handleScale()
+		}
 		return nil
 	case 'd':
 		a.handleDescribe()
 		return nil
 	case 'u':
 		a.handleForceUpdate()
+		return nil
+	case 'e':
+		a.handleEdit()
+		return nil
+	case 'k':
+		a.handleKill()
 		return nil
 	}
 
@@ -311,16 +333,22 @@ func (a *App) updateHints() {
 	switch a.current {
 	case viewServices:
 		extra = chip("Enter", "LOGS") + "   " + chip("d", "DESCRIBE") + "   " +
-			chip("l", "LOGS") + "   " + chip("s", "SCALE") + "   " +
-			chip("u", "UPDATE") + "   " + chip("Ctrl-D", "DELETE")
+			chip("e", "EDIT") + "   " + chip("l", "LOGS") + "   " +
+			chip("s", "SCALE") + "   " + chip("u", "UPDATE") + "   " + chip("Ctrl-D", "DELETE")
 	case viewContainers:
 		extra = chip("Enter", "LOGS") + "   " + chip("d", "DESCRIBE") + "   " +
+			chip("s", "SHELL") + "   " + chip("k", "KILL") + "   " +
 			chip("l", "LOGS") + "   " + chip("Ctrl-D", "DELETE")
 	case viewStacks:
-		extra = chip("Enter", "SERVICES") + "   " + chip("l", "LOGS") + "   " + chip("Ctrl-D", "DELETE")
+		extra = chip("Enter", "SERVICES") + "   " + chip("e", "EDIT") + "   " +
+			chip("l", "LOGS") + "   " + chip("Ctrl-D", "DELETE")
 	case viewNodes:
 		extra = chip("Enter", "DESCRIBE") + "   " + chip("d", "DESCRIBE")
 	case viewConfigs, viewSecrets:
+		extra = chip("Enter", "DESCRIBE") + "   " + chip("d", "DESCRIBE") + "   " + chip("Ctrl-D", "DELETE")
+	case viewVolumes:
+		extra = chip("Enter", "DESCRIBE") + "   " + chip("d", "DESCRIBE") + "   " + chip("Ctrl-D", "DELETE")
+	case viewNetworks:
 		extra = chip("Enter", "DESCRIBE") + "   " + chip("d", "DESCRIBE") + "   " + chip("Ctrl-D", "DELETE")
 	}
 
@@ -367,6 +395,8 @@ func (a *App) showAliases() {
 	sb.WriteString("  :nodes      :node  :no\n")
 	sb.WriteString("  :configs    :config :cm\n")
 	sb.WriteString("  :secrets    :secret :sec\n")
+	sb.WriteString("  :volumes    :volume :vol  :pv\n")
+	sb.WriteString("  :networks   :network :net :ns\n")
 	sb.WriteString("\n[aqua]Other commands[-]\n")
 	sb.WriteString("  :alias  :aliases          — show this list\n")
 	sb.WriteString("  :context                  — list configured managers\n")
@@ -374,10 +404,12 @@ func (a *App) showAliases() {
 	sb.WriteString("  :quit   :q   :exit        — quit\n")
 	sb.WriteString("\n[aqua]Keyboard shortcuts (on the main table)[-]\n")
 	sb.WriteString("  :        open command bar\n")
-	sb.WriteString("  Enter    describe selected resource (JSON)\n")
-	sb.WriteString("  d        describe selected resource (JSON)\n")
+	sb.WriteString("  Enter    logs (services/containers) or describe (other)\n")
+	sb.WriteString("  d        describe / JSON inspect\n")
+	sb.WriteString("  e        edit service spec in $EDITOR (services, stacks)\n")
 	sb.WriteString("  l        view logs (containers / services / stacks)\n")
-	sb.WriteString("  s        scale a service\n")
+	sb.WriteString("  s        scale a service  /  open shell in container\n")
+	sb.WriteString("  k        kill container with SIGKILL (containers view)\n")
 	sb.WriteString("  u        force-update / rolling restart a service\n")
 	sb.WriteString("  Ctrl-D   delete selected resource (with confirmation)\n")
 	sb.WriteString("  r        force refresh\n")

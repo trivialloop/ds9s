@@ -17,7 +17,9 @@ type rowMeta struct {
 	id          string
 	name        string
 	serviceID   string // tasks: parent service ID (used for ServiceLogs)
-	containerID string // tasks: underlying container ID (used for ContainerRemove)
+	containerID string // tasks: underlying container ID (used for ContainerRemove/kill)
+	nodeName    string // tasks: Docker OS hostname of the node
+	nodeAddr    string // tasks: Swarm advertise IP of the node — used as SSH target (more reliable than hostname)
 }
 
 func (a *App) refreshCurrent() error {
@@ -35,6 +37,10 @@ func (a *App) refreshCurrent() error {
 		return a.refreshConfigs()
 	case viewSecrets:
 		return a.refreshSecrets()
+	case viewVolumes:
+		return a.refreshVolumes()
+	case viewNetworks:
+		return a.refreshNetworks()
 	default:
 		return fmt.Errorf("unknown view %s", a.current)
 	}
@@ -144,6 +150,8 @@ func (a *App) refreshContainers() error {
 			name:        t.Name,
 			serviceID:   t.ServiceID,
 			containerID: t.ContainerID,
+			nodeName:    t.NodeName,
+			nodeAddr:    t.NodeAddr,
 		}
 		setCell(a.table, row, 0, t.Name, ref)
 		setCell(a.table, row, 1, t.ServiceName, nil)
@@ -229,6 +237,117 @@ func (a *App) refreshConfigs() error {
 		setCell(a.table, row, 3, dockerx.ShortID(c.ID), nil)
 	}
 	a.setStatus(fmt.Sprintf("%d configs", len(configs)))
+	return nil
+}
+
+// --- Volumes ----------------------------------------------------------------
+
+func (a *App) refreshVolumes() error {
+	ctx, cancel := a.ctx()
+	defer cancel()
+
+	// With SSH config: fetch volumes from every node in parallel via SSH.
+	if a.conn.Manager.SSH != nil {
+		vols, errs := a.store.AllNodeVolumes(ctx)
+		setHeaderRow(a.table, "NODE", "NAME", "DRIVER", "SCOPE", "MOUNTPOINT")
+		for i, v := range vols {
+			row := i + 1
+			ref := &rowMeta{kind: viewVolumes, id: v.NodeAddr + "/" + v.VolumeName, name: v.VolumeName}
+			setCell(a.table, row, 0, v.NodeName, ref)
+			setCell(a.table, row, 1, v.VolumeName, nil)
+			setCell(a.table, row, 2, v.Driver, nil)
+			setCell(a.table, row, 3, v.Scope, nil)
+			mp := v.Mountpoint
+			if len(mp) > 50 {
+				mp = "…" + mp[len(mp)-49:]
+			}
+			setCell(a.table, row, 4, mp, nil)
+		}
+		nodeList := make([]string, len(vols))
+		for i, v := range vols {
+			nodeList[i] = v.NodeName
+		}
+		status := fmt.Sprintf("%d volumes across %d nodes", len(vols), countUniqueNodes(nodeList))
+		if len(errs) > 0 {
+			status += fmt.Sprintf("  [yellow](%d nodes unreachable)", len(errs))
+		}
+		a.setStatus(status)
+		return nil
+	}
+
+	// No SSH: show manager volumes only.
+	vols, err := a.store.Volumes(ctx)
+	if err != nil {
+		return err
+	}
+	setHeaderRow(a.table, "NODE", "NAME", "DRIVER", "SCOPE", "MOUNTPOINT")
+	for i, v := range vols {
+		row := i + 1
+		ref := &rowMeta{kind: viewVolumes, id: v.Name, name: v.Name}
+		setCell(a.table, row, 0, a.conn.Manager.Name, ref)
+		setCell(a.table, row, 1, v.Name, nil)
+		setCell(a.table, row, 2, v.Driver, nil)
+		setCell(a.table, row, 3, v.Scope, nil)
+		mp := v.Mountpoint
+		if len(mp) > 50 {
+			mp = "…" + mp[len(mp)-49:]
+		}
+		setCell(a.table, row, 4, mp, nil)
+	}
+	a.setStatus(fmt.Sprintf("%d volumes (manager node only — no SSH config)", len(vols)))
+	return nil
+}
+
+func countUniqueNodes(nodeNames []string) int {
+	s := map[string]struct{}{}
+	for _, n := range nodeNames {
+		s[n] = struct{}{}
+	}
+	return len(s)
+}
+
+// --- Networks ---------------------------------------------------------------
+
+func (a *App) refreshNetworks() error {
+	ctx, cancel := a.ctx()
+	defer cancel()
+
+	if a.conn.Manager.SSH != nil {
+		nets, errs := a.store.AllNodeNetworks(ctx)
+		setHeaderRow(a.table, "NODE", "NAME", "DRIVER", "SCOPE", "ID")
+		for i, n := range nets {
+			row := i + 1
+			ref := &rowMeta{kind: viewNetworks, id: n.ID, name: n.Name}
+			setCell(a.table, row, 0, n.NodeName, ref)
+			setCell(a.table, row, 1, n.Name, nil)
+			setCell(a.table, row, 2, n.Driver, nil)
+			setCell(a.table, row, 3, n.Scope, nil)
+			setCell(a.table, row, 4, dockerx.ShortID(n.ID), nil)
+		}
+		status := fmt.Sprintf("%d networks", len(nets))
+		if len(errs) > 0 {
+			status += fmt.Sprintf("  [yellow](%d nodes unreachable)", len(errs))
+		}
+		a.setStatus(status)
+		return nil
+	}
+
+	// No SSH: show manager networks (includes cluster-wide overlay networks).
+	nets, err := a.store.Networks(ctx)
+	if err != nil {
+		return err
+	}
+	setHeaderRow(a.table, "NODE", "NAME", "DRIVER", "SCOPE", "ID")
+	for i, n := range nets {
+		row := i + 1
+		ref := &rowMeta{kind: viewNetworks, id: n.ID, name: n.Name}
+		setCell(a.table, row, 0, "(cluster)", ref)
+		setCell(a.table, row, 1, n.Name, nil)
+		setCell(a.table, row, 2, n.Driver, nil)
+		setCell(a.table, row, 3, n.Scope, nil)
+		setCell(a.table, row, 4, dockerx.ShortID(n.ID), nil)
+	}
+	a.setStatus(fmt.Sprintf("%d networks (manager node — no SSH config)", len(nets)))
 	return nil
 }
 
