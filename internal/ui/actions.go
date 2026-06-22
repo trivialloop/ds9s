@@ -9,12 +9,14 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/swarm"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+	"golang.org/x/term"
 
 	"ds9s/internal/dockerx"
 )
@@ -63,47 +65,8 @@ func (a *App) prompt(label, defaultValue string, onSubmit func(value string)) {
 }
 
 func (a *App) showHelp() {
-	help := tview.NewTextView().SetDynamicColors(true)
-	help.SetText(`[yellow::b]ds9s - help[-:-:-]
-
-[aqua]Command bar (press : to open)[-]
-  :services, :svc        switch to services view
-  :containers, :co, :ps  switch to containers view
-  :stacks                switch to stacks view
-  :nodes                 switch to nodes view
-  :configs               switch to configs view
-  :secrets               switch to secrets view
-  :alias, :aliases       list all commands and aliases
-  :context               list configured managers
-  :context <name>        switch to another manager
-  :quit / :q             quit ds9s
-
-[aqua]Global keys[-]
-  :        open the command bar
-  r        force refresh
-  Enter    describe selected resource (JSON)
-  d        describe (JSON)
-  l        view logs (containers/services/stacks)
-  s        scale a service
-  u        force-update (rolling restart) a service
-  Ctrl-D   delete the selected resource (with confirmation)
-  ?        this help
-  q        quit
-  Esc      close overlay / go back
-
-Press Esc or Enter to close this help.`)
-	help.SetBorder(true).SetTitle(" Help ")
-	help.SetDoneFunc(func(key tcell.Key) { a.pages.RemovePage("help"); a.tv.SetFocus(a.table) })
-	help.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyEscape || event.Key() == tcell.KeyEnter {
-			a.pages.RemovePage("help")
-			a.tv.SetFocus(a.table)
-			return nil
-		}
-		return event
-	})
-	a.pages.AddPage("help", help, true, true)
-	a.tv.SetFocus(help)
+	// ? and :alias show the same content.
+	a.showAliases()
 }
 
 // --- Delete ------------------------------------------------------------------
@@ -121,11 +84,25 @@ func (a *App) handleDelete() {
 		case viewServices:
 			err = a.store.RemoveService(ctx, ref.id)
 		case viewContainers:
-			// ref.containerID is the actual container ID; ref.id is the task ID.
-			// Removal only succeeds if the container runs on the connected manager.
 			if ref.containerID == "" {
 				err = fmt.Errorf("container ID not available (task not yet running)")
+				break
+			}
+			sshTarget := ref.nodeAddr
+			if sshTarget == "" {
+				sshTarget = ref.nodeName
+			}
+			if a.conn.Manager.SSH == nil && sshTarget != "" {
+				err = fmt.Errorf("container is on node %s — add an ssh: block to this manager in ds9s config for cross-node delete", sshTarget)
+			} else if a.conn.Manager.SSH != nil && sshTarget != "" {
+				// SSH path: mirror the kill mechanism — remote docker rm -f on the node that owns the container.
+				rmCmd := "docker rm -f " + ref.containerID
+				if a.conn.Manager.SSH.Sudo {
+					rmCmd = "sudo -n " + rmCmd
+				}
+				_, err = dockerx.RunCommandOnNode(*a.conn.Manager.SSH, sshTarget, rmCmd)
 			} else {
+				// Manager-local container (or task not yet assigned): use the Docker API.
 				err = a.store.RemoveContainer(ctx, ref.containerID, true)
 			}
 		case viewStacks:
@@ -667,9 +644,38 @@ func (a *App) handleShell() {
 
 	var shellErr error
 	a.tv.Suspend(func() {
-		// Clear the screen so the shell starts on a clean terminal instead of
-		// showing whatever was behind the ds9s TUI.
-		fmt.Print("\033[H\033[2J\033[3J")
+		// Enter a fresh alternate screen buffer for the shell session so the
+		// primary buffer (the original terminal) is completely untouched.
+		fmt.Print("\033[?1049h\033[H\033[2J")
+		defer fmt.Print("\033[?1049l") // exit alternate screen when shell ends
+
+		// Print a fixed info bar at the top of the alternate screen, mimicking
+		// the log view header. It is printed once; the shell's output will scroll
+		// below it. If the user runs a full-screen program inside the shell (e.g.
+		// vim), the bar will be overwritten temporarily and restored on exit.
+		termW, _, _ := term.GetSize(int(os.Stdin.Fd()))
+		if termW <= 0 {
+			termW = 80
+		}
+		shortID := ref.containerID
+		if len(shortID) > 12 {
+			shortID = shortID[:12]
+		}
+		node := ref.nodeAddr
+		if node == "" {
+			node = ref.nodeName
+		}
+		if node == "" {
+			node = "?"
+		}
+		stack := ref.stackName
+		if stack == "" {
+			stack = "-"
+		}
+		fmt.Printf("\033[1;1H") // cursor to row 1
+		fmt.Printf("  \033[1mNode:\033[0m %-18s  \033[1mStack:\033[0m %-15s  \033[1mService:\033[0m %-20s  \033[1mContainer:\033[0m %s\r\n",
+			ref.nodeName, stack, ref.serviceName, shortID)
+		fmt.Printf("%s\r\n\r\n", strings.Repeat("─", termW))
 
 		if a.conn.Manager.SSH != nil {
 			shellErr = dockerx.ShellInContainer(*a.conn.Manager.SSH, sshTarget, ref.containerID)
@@ -715,16 +721,44 @@ func (a *App) handleKill() {
 }
 
 func (a *App) doKill(containerID, sshTarget, displayName string) {
-	var killErr error
+	// No SSH config but the container is on a worker: the Docker API only
+	// reaches the manager's local containers — show a clear message instead of
+	// the confusing "No such container" error from the manager's daemon.
+	if a.conn.Manager.SSH == nil && sshTarget != "" {
+		a.tv.QueueUpdateDraw(func() {
+			msg := fmt.Sprintf(
+				"[red]Cannot kill cross-node container[-]\n\n"+
+					"[yellow]%s[-] is on node [yellow]%s[-].\n\n"+
+					"The Docker API only reaches containers on the manager node.\n"+
+					"Add an [white]ssh:[-] section to this manager in ds9s config\n"+
+					"to enable SSH-based kill on worker nodes.\n\n"+
+					"[grey]Press Esc or Enter to dismiss[-]",
+				displayName, sshTarget)
+			a.showInfoPage("kill-error", " Kill Error ", msg)
+		})
+		return
+	}
+
+	var (
+		killErr    error
+		killMethod string
+		remoteCmd  string
+	)
 
 	if a.conn.Manager.SSH != nil && sshTarget != "" {
-		remoteKill := "docker kill " + containerID
+		// SSH path: exactly the same mechanism as handleShell — SSH to the node
+		// that owns the container, then run docker kill with the full container ID.
+		killMethod = "SSH → " + sshTarget
+		remoteCmd = "docker kill " + containerID
 		if a.conn.Manager.SSH.Sudo {
-			remoteKill = "sudo -n " + remoteKill
+			remoteCmd = "sudo -n " + remoteCmd
 		}
-		_, killErr = dockerx.RunCommandOnNode(*a.conn.Manager.SSH, sshTarget, remoteKill)
+		_, killErr = dockerx.RunCommandOnNode(*a.conn.Manager.SSH, sshTarget, remoteCmd)
 	} else {
-		// Local Docker API — works only if container is on the manager node.
+		// Docker API path: works for containers on the manager node only.
+		// sshTarget is empty (task not yet assigned to a node) or SSH is nil
+		// but we already handled the SSH-nil+sshTarget case above.
+		killMethod = "Docker API (manager)"
 		ctx, cancel := a.ctx()
 		defer cancel()
 		killErr = a.store.KillContainer(ctx, containerID)
@@ -732,10 +766,13 @@ func (a *App) doKill(containerID, sshTarget, displayName string) {
 
 	a.tv.QueueUpdateDraw(func() {
 		if killErr != nil {
-			// Show the error in a dismissible page — it would be overwritten by the
-			// auto-refresh status if we only used setStatus().
-			msg := fmt.Sprintf("[red]Kill failed for %s on %s[-]\n\n%v\n\n[grey]Press Esc or Enter to dismiss[-]",
-				displayName, sshTarget, killErr)
+			hint := ""
+			if sshTarget == "" {
+				hint = "\n\n[grey]Tip: node address is unknown — the task may still be starting[-]"
+			}
+			msg := fmt.Sprintf(
+				"[red]Kill failed[-]  (via %s)\n[grey]Command: %s[-]\n\n[white]%v[-]%s\n\n[grey]Press Esc or Enter to dismiss[-]",
+				killMethod, remoteCmd, killErr, hint)
 			a.showInfoPage("kill-error", " Kill Error ", msg)
 		} else {
 			a.setStatus(fmt.Sprintf("[green]killed %s", displayName))

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"sort"
 	"strings"
 
@@ -212,17 +213,18 @@ type TaskInfo struct {
 	Name        string // "serviceName.slot" (replicated) or "serviceName.shortID" (global)
 	ServiceID   string
 	ServiceName string
+	StackName   string // docker stack namespace label (empty when not part of a stack)
 	NodeName    string // Docker OS hostname of the node (from node.Description.Hostname)
-	NodeAddr    string // Swarm advertise address of the node (from node.Status.Addr) — more reliable for SSH
+	NodeAddr    string // Swarm advertise IP of the node — port stripped so it is safe to use as SSH target
 	State       string
 	Image       string
 	ContainerID string
 }
 
-// AllTasks returns all Swarm tasks whose desired state is "running", with
-// service and node names resolved. This gives a cluster-wide view of every
-// container without having to SSH into individual worker nodes.
-func (s *Store) AllTasks(ctx context.Context) ([]TaskInfo, error) {
+// AllTasks returns Swarm tasks with service and node names resolved.
+// When runningOnly is true only tasks whose desired state is "running" are
+// returned (the default view). Pass false to include stopped/failed tasks too.
+func (s *Store) AllTasks(ctx context.Context, runningOnly bool) ([]TaskInfo, error) {
 	tasks, err := s.conn.Client.TaskList(ctx, types.TaskListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("listing tasks: %w", err)
@@ -237,20 +239,28 @@ func (s *Store) AllTasks(ctx context.Context) ([]TaskInfo, error) {
 	}
 
 	svcNames := make(map[string]string, len(services))
+	svcStacks := make(map[string]string, len(services))
 	for _, svc := range services {
 		svcNames[svc.ID] = svc.Spec.Name
+		svcStacks[svc.ID] = svc.Spec.Labels[stackLabel]
 	}
 	nodeNames := make(map[string]string, len(nodes))
 	nodeAddrs := make(map[string]string, len(nodes))
 	for _, n := range nodes {
 		nodeNames[n.ID] = n.Description.Hostname
-		nodeAddrs[n.ID] = n.Status.Addr
+		// Status.Addr is the Swarm advertise address; it sometimes includes a
+		// port (e.g. "10.0.0.5:2377"). Strip the port so the address is safe
+		// to use as an SSH target.
+		addr := n.Status.Addr
+		if h, _, err := net.SplitHostPort(addr); err == nil {
+			addr = h
+		}
+		nodeAddrs[n.ID] = addr
 	}
 
 	var infos []TaskInfo
 	for _, t := range tasks {
-		// Only show tasks the scheduler intends to keep running.
-		if t.DesiredState != swarm.TaskStateRunning {
+		if runningOnly && t.DesiredState != swarm.TaskStateRunning {
 			continue
 		}
 		svcName := svcNames[t.ServiceID]
@@ -276,6 +286,7 @@ func (s *Store) AllTasks(ctx context.Context) ([]TaskInfo, error) {
 			Name:        name,
 			ServiceID:   t.ServiceID,
 			ServiceName: svcName,
+			StackName:   svcStacks[t.ServiceID],
 			NodeName:    nodeNames[t.NodeID],
 			NodeAddr:    nodeAddrs[t.NodeID],
 			State:       string(t.Status.State),

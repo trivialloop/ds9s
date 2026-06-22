@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/docker/docker/api/types/swarm"
+	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 
 	"ds9s/internal/dockerx"
@@ -17,41 +18,88 @@ type rowMeta struct {
 	id          string
 	name        string
 	serviceID   string // tasks: parent service ID (used for ServiceLogs)
+	serviceName string // tasks: human-readable service name
+	stackName   string // tasks: docker stack namespace (empty when not in a stack)
 	containerID string // tasks: underlying container ID (used for ContainerRemove/kill)
 	nodeName    string // tasks: Docker OS hostname of the node
 	nodeAddr    string // tasks: Swarm advertise IP of the node — used as SSH target (more reliable than hostname)
 }
 
 func (a *App) refreshCurrent() error {
+	// Save scroll/selection before refresh. We do NOT call table.Clear() on
+	// auto-refresh — instead each refreshXxx updates cells in-place. This
+	// keeps column widths stable (no recomputation from scratch) and prevents
+	// tview's clampSelection from resetting the column offset to 0 during
+	// the subsequent Draw() call.
+	rowOff, colOff := a.table.GetOffset()
+	selRow, selCol := a.table.GetSelection()
+	prevRows := a.table.GetRowCount()
+
 	a.refreshHeader()
+
+	var err error
 	switch a.current {
 	case viewServices:
-		return a.refreshServices()
+		err = a.refreshServices()
 	case viewContainers:
-		return a.refreshContainers()
+		err = a.refreshContainers()
 	case viewStacks:
-		return a.refreshStacks()
+		err = a.refreshStacks()
 	case viewNodes:
-		return a.refreshNodes()
+		err = a.refreshNodes()
 	case viewConfigs:
-		return a.refreshConfigs()
+		err = a.refreshConfigs()
 	case viewSecrets:
-		return a.refreshSecrets()
+		err = a.refreshSecrets()
 	case viewVolumes:
-		return a.refreshVolumes()
+		err = a.refreshVolumes()
 	case viewNetworks:
-		return a.refreshNetworks()
+		err = a.refreshNetworks()
 	default:
-		return fmt.Errorf("unknown view %s", a.current)
+		err = fmt.Errorf("unknown view %s", a.current)
 	}
+
+	if err != nil {
+		return err
+	}
+
+	// Blank out rows that are no longer in the dataset (table shrank).
+	// We never call table.Clear() during auto-refresh, so we must erase
+	// the leftover rows from the previous (larger) result set manually.
+	newRows := a.table.GetRowCount()
+	colCount := a.table.GetColumnCount()
+	for row := newRows; row < prevRows; row++ {
+		for col := 0; col < colCount; col++ {
+			a.table.SetCell(row, col, tview.NewTableCell(""))
+		}
+	}
+
+	// Restore scroll and selection. Call Select before SetOffset so that
+	// tview's internal clampSelection (triggered by Select) runs first;
+	// SetOffset then overrides the column offset unconditionally.
+	rows := a.table.GetRowCount()
+	if rows > 1 {
+		if selRow < 1 || selRow >= rows {
+			selRow = 1
+		}
+		a.table.Select(selRow, selCol)
+		a.table.SetOffset(rowOff, colOff)
+	}
+
+	return nil
 }
 
 func setHeaderRow(table *tview.Table, cols ...string) {
-	table.Clear()
+	// Do NOT call table.Clear() here. Clearing the table on every auto-refresh
+	// forces tview to recompute column widths from scratch, which shifts all
+	// cell positions and causes the column-header row to flicker. It also resets
+	// the column offset (via clampSelection in Draw), undoing any horizontal
+	// scroll the user had. Instead we update the header cells in-place and let
+	// refreshCurrent erase only the rows that are no longer in the dataset.
 	for i, c := range cols {
 		table.SetCell(0, i, tview.NewTableCell(c).
 			SetSelectable(false).
-			SetAttributes(1<<1). // bold
+			SetAttributes(1). // tcell.AttrBold = 1<<0 = 1 (NOT 1<<1 which is AttrBlink)
 			SetTextColor(tview.Styles.SecondaryTextColor))
 	}
 }
@@ -133,10 +181,24 @@ func serviceModeAndReplicas(svc swarm.Service) (mode string, replicas string) {
 // Uses TaskList (manager API) to show containers across ALL nodes, not just
 // those running on the connected manager daemon.
 
+// taskStateColor returns the row color for a given Swarm task state.
+func taskStateColor(state string) tcell.Color {
+	switch state {
+	case "running":
+		return tcell.ColorWhite
+	case "starting", "preparing", "assigned", "accepted", "ready", "new", "pending":
+		return tcell.ColorYellow
+	case "failed", "rejected", "orphaned":
+		return tcell.ColorRed
+	default: // complete, shutdown, remove
+		return tcell.ColorGray
+	}
+}
+
 func (a *App) refreshContainers() error {
 	ctx, cancel := a.ctx()
 	defer cancel()
-	tasks, err := a.store.AllTasks(ctx)
+	tasks, err := a.store.AllTasks(ctx, !a.containersShowAll)
 	if err != nil {
 		return err
 	}
@@ -149,18 +211,27 @@ func (a *App) refreshContainers() error {
 			id:          t.ID,
 			name:        t.Name,
 			serviceID:   t.ServiceID,
+			serviceName: t.ServiceName,
+			stackName:   t.StackName,
 			containerID: t.ContainerID,
 			nodeName:    t.NodeName,
 			nodeAddr:    t.NodeAddr,
 		}
-		setCell(a.table, row, 0, t.Name, ref)
-		setCell(a.table, row, 1, t.ServiceName, nil)
-		setCell(a.table, row, 2, t.NodeName, nil)
-		setCell(a.table, row, 3, t.State, nil)
-		setCell(a.table, row, 4, t.Image, nil)
-		setCell(a.table, row, 5, dockerx.ShortID(t.ID), nil)
+		color := taskStateColor(t.State)
+		values := []string{t.Name, t.ServiceName, t.NodeName, t.State, t.Image, dockerx.ShortID(t.ID)}
+		for col, v := range values {
+			cell := tview.NewTableCell(v).SetTextColor(color)
+			if col == 0 {
+				cell.SetReference(*ref)
+			}
+			a.table.SetCell(row, col, cell)
+		}
 	}
-	a.setStatus(fmt.Sprintf("%d tasks (cluster-wide)", len(tasks)))
+	filterNote := "running only"
+	if a.containersShowAll {
+		filterNote = "running + stopped"
+	}
+	a.setStatus(fmt.Sprintf("%d tasks (cluster-wide, %s)", len(tasks), filterNote))
 	return nil
 }
 

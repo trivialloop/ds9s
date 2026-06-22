@@ -62,6 +62,14 @@ type App struct {
 
 	current  viewName
 	stopPoll chan struct{}
+
+	// containers view filter: false = running only (default), true = running + stopped
+	containersShowAll bool
+
+	// cached rendered text — only update widgets when content actually changes
+	// to prevent unnecessary screen redraws (flicker) during auto-refresh.
+	lastHeaderText string
+	lastHintsText  string
 }
 
 // NewApp wires up the UI for the given config; the manager to connect to
@@ -81,7 +89,7 @@ func NewApp(cfg *config.Config) (*App, error) {
 		cfg:     cfg,
 		conn:    conn,
 		store:   dockerx.NewStore(conn),
-		current: viewServices,
+		current: viewContainers,
 	}
 	a.build()
 	return a, nil
@@ -269,6 +277,16 @@ func (a *App) globalKeys(event *tcell.EventKey) *tcell.EventKey {
 	case 'k':
 		a.handleKill()
 		return nil
+	case 'f':
+		if a.current == viewContainers {
+			a.containersShowAll = !a.containersShowAll
+			a.table.Clear() // force full rebuild so shrinking row count removes stale rows
+			a.lastHintsText = ""
+			if err := a.refreshCurrent(); err != nil {
+				a.setStatus(fmt.Sprintf("[red]%v", err))
+			}
+		}
+		return nil
 	}
 
 	return event
@@ -309,14 +327,22 @@ func (a *App) runCommand(cmdline string) {
 
 func (a *App) switchView(vn viewName) {
 	a.current = vn
+	// Full reset when switching views: clear the table so cells from the
+	// previous view don't bleed through, and reset scroll to the top-left.
+	a.table.Clear()
+	a.table.SetOffset(0, 0)
 	if err := a.refreshCurrent(); err != nil {
 		a.setStatus(fmt.Sprintf("[red]%v", err))
 	}
 }
 
 func (a *App) refreshHeader() {
-	a.header.SetText(fmt.Sprintf(" [yellow::b]ds9s[-:-:-]  manager:[green]%s[-]  host:[grey]%s[-]  view:[aqua]%s[-]",
-		a.conn.Manager.Name, a.conn.Manager.Host, a.current))
+	text := fmt.Sprintf(" [yellow::b]ds9s[-:-:-]  manager:[green]%s[-]  host:[grey]%s[-]  view:[aqua]%s[-]",
+		a.conn.Manager.Name, a.conn.Manager.Host, a.current)
+	if text != a.lastHeaderText {
+		a.lastHeaderText = text
+		a.header.SetText(text)
+	}
 	a.updateHints()
 }
 
@@ -327,7 +353,7 @@ func (a *App) updateHints() {
 		return fmt.Sprintf("[black:teal:b] %s [-:-:-] [white]%s[-]", key, label)
 	}
 	// Common hints present on every view.
-	common := "  " + chip(":", "CMD") + "   " + chip("r", "REFRESH") + "   " + chip("?", "HELP") + "   " + chip("q", "QUIT")
+	common := "  " + chip("r", "REFRESH") + "   " + chip("?", "HELP") + "   " + chip("q", "QUIT")
 
 	var extra string
 	switch a.current {
@@ -336,9 +362,13 @@ func (a *App) updateHints() {
 			chip("e", "EDIT") + "   " + chip("l", "LOGS") + "   " +
 			chip("s", "SCALE") + "   " + chip("u", "UPDATE") + "   " + chip("Ctrl-D", "DELETE")
 	case viewContainers:
+		filterLabel := "RUNNING"
+		if a.containersShowAll {
+			filterLabel = "ALL"
+		}
 		extra = chip("Enter", "LOGS") + "   " + chip("d", "DESCRIBE") + "   " +
 			chip("s", "SHELL") + "   " + chip("k", "KILL") + "   " +
-			chip("l", "LOGS") + "   " + chip("Ctrl-D", "DELETE")
+			chip("l", "LOGS") + "   " + chip("f", filterLabel)
 	case viewStacks:
 		extra = chip("Enter", "SERVICES") + "   " + chip("e", "EDIT") + "   " +
 			chip("l", "LOGS") + "   " + chip("Ctrl-D", "DELETE")
@@ -352,10 +382,15 @@ func (a *App) updateHints() {
 		extra = chip("Enter", "DESCRIBE") + "   " + chip("d", "DESCRIBE") + "   " + chip("Ctrl-D", "DELETE")
 	}
 
+	var text string
 	if extra != "" {
-		a.hints.SetText("  " + extra + "   " + common[2:]) // merge, trim leading spaces once
+		text = "  " + extra + "   " + common[2:]
 	} else {
-		a.hints.SetText(common)
+		text = common
+	}
+	if text != a.lastHintsText {
+		a.lastHintsText = text
+		a.hints.SetText(text)
 	}
 }
 
@@ -387,37 +422,36 @@ func (a *App) showInfoPage(pageName, title, text string) {
 
 func (a *App) showAliases() {
 	var sb strings.Builder
-	sb.WriteString("[yellow::b]ds9s — commands & aliases[-:-:-]\n\n")
+	sb.WriteString("[yellow::b]ds9s — help & aliases[-:-:-]\n\n")
 	sb.WriteString("[aqua]Resource views (use with :)[-]\n")
-	sb.WriteString("  :services   :svc  :svcs  :service\n")
-	sb.WriteString("  :containers :co   :ctr   :container  :ps\n")
-	sb.WriteString("  :stacks     :stack :stk\n")
-	sb.WriteString("  :nodes      :node  :no\n")
-	sb.WriteString("  :configs    :config :cm\n")
-	sb.WriteString("  :secrets    :secret :sec\n")
-	sb.WriteString("  :volumes    :volume :vol  :pv\n")
-	sb.WriteString("  :networks   :network :net :ns\n")
+	sb.WriteString("  :services    :svc  :svcs  :service\n")
+	sb.WriteString("  :containers  :co   :ctr   :container  :ps\n")
+	sb.WriteString("  :stacks      :stack  :stk\n")
+	sb.WriteString("  :nodes       :node   :no\n")
+	sb.WriteString("  :configs     :config :cm\n")
+	sb.WriteString("  :secrets     :secret :sec\n")
+	sb.WriteString("  :volumes     :volume :vol  :pv\n")
+	sb.WriteString("  :networks    :network :net :ns\n")
 	sb.WriteString("\n[aqua]Other commands[-]\n")
-	sb.WriteString("  :alias  :aliases          — show this list\n")
-	sb.WriteString("  :context                  — list configured managers\n")
-	sb.WriteString("  :context [name]           — switch to another manager\n")
-	sb.WriteString("  :quit   :q   :exit        — quit\n")
+	sb.WriteString("  :alias  	:aliases     	— show this help\n")
+	sb.WriteString("  :context 	:ctx			— switch to another manager\n")
+	sb.WriteString("  :quit   	:q   :exit     	— quit\n")
 	sb.WriteString("\n[aqua]Keyboard shortcuts (on the main table)[-]\n")
 	sb.WriteString("  :        open command bar\n")
-	sb.WriteString("  Enter    logs (services/containers) or describe (other)\n")
+	sb.WriteString("  Enter    logs (services/containers) or drill-down (other)\n")
 	sb.WriteString("  d        describe / JSON inspect\n")
 	sb.WriteString("  e        edit service spec in $EDITOR (services, stacks)\n")
 	sb.WriteString("  l        view logs (containers / services / stacks)\n")
-	sb.WriteString("  s        scale a service  /  open shell in container\n")
+	sb.WriteString("  s        scale replicas (services)  /  shell in container\n")
 	sb.WriteString("  k        kill container with SIGKILL (containers view)\n")
-	sb.WriteString("  u        force-update / rolling restart a service\n")
+	sb.WriteString("  u        force-update / rolling restart (services)\n")
 	sb.WriteString("  Ctrl-D   delete selected resource (with confirmation)\n")
 	sb.WriteString("  r        force refresh\n")
-	sb.WriteString("  ?        help\n")
+	sb.WriteString("  ?        this help\n")
 	sb.WriteString("  q        quit\n")
 	sb.WriteString("  Esc      close current overlay / go back\n")
 	sb.WriteString("\nPress [Esc] or [Enter] to close.")
-	a.showInfoPage("aliases", " Commands & Aliases ", sb.String())
+	a.showInfoPage("aliases", " Help & Aliases ", sb.String())
 }
 
 func (a *App) showContexts() {
@@ -468,6 +502,8 @@ func (a *App) switchContext(managerName string) {
 			a.conn = conn
 			a.store = dockerx.NewStore(conn)
 			a.cfg.Current = managerName
+			a.table.Clear()
+			a.table.SetOffset(0, 0)
 			if e := a.refreshCurrent(); e != nil {
 				a.setStatus(fmt.Sprintf("[red]%v", e))
 				return
