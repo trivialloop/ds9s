@@ -61,26 +61,30 @@ func (a *App) showHelp() {
 	help := tview.NewTextView().SetDynamicColors(true)
 	help.SetText(`[yellow::b]ds9s - help[-:-:-]
 
-[aqua]Command bar[-]
+[aqua]Command bar (press : to open)[-]
   :services, :svc        switch to services view
   :containers, :co, :ps  switch to containers view
   :stacks                switch to stacks view
   :nodes                 switch to nodes view
   :configs               switch to configs view
   :secrets               switch to secrets view
+  :alias, :aliases       list all commands and aliases
+  :context               list configured managers
+  :context <name>        switch to another manager
   :quit / :q             quit ds9s
 
 [aqua]Global keys[-]
   :        open the command bar
   r        force refresh
-  Enter    drill in / inspect
+  Enter    describe selected resource (JSON)
+  d        describe (JSON)
   l        view logs (containers/services/stacks)
-  d        describe (inspect JSON)
   s        scale a service
   u        force-update (rolling restart) a service
   Ctrl-D   delete the selected resource (with confirmation)
   ?        this help
   q        quit
+  Esc      close overlay / go back
 
 Press Esc or Enter to close this help.`)
 	help.SetBorder(true).SetTitle(" Help ")
@@ -112,7 +116,13 @@ func (a *App) handleDelete() {
 		case viewServices:
 			err = a.store.RemoveService(ctx, ref.id)
 		case viewContainers:
-			err = a.store.RemoveContainer(ctx, ref.id, true)
+			// ref.containerID is the actual container ID; ref.id is the task ID.
+			// Removal only succeeds if the container runs on the connected manager.
+			if ref.containerID == "" {
+				err = fmt.Errorf("container ID not available (task not yet running)")
+			} else {
+				err = a.store.RemoveContainer(ctx, ref.containerID, true)
+			}
 		case viewStacks:
 			if errs := a.store.RemoveStack(ctx, ref.id); len(errs) > 0 {
 				err = errs[0]
@@ -198,7 +208,7 @@ func (a *App) handleDescribe() {
 	case viewServices:
 		data, _, err = a.conn.Client.ServiceInspectWithRaw(ctx, ref.id, types.ServiceInspectOptions{})
 	case viewContainers:
-		data, err = a.store.InspectContainer(ctx, ref.id)
+		data, _, err = a.conn.Client.TaskInspectWithRaw(ctx, ref.id)
 	case viewNodes:
 		data, _, err = a.conn.Client.NodeInspectWithRaw(ctx, ref.id)
 	case viewConfigs:
@@ -220,7 +230,14 @@ func (a *App) handleDescribe() {
 		a.setStatus(fmt.Sprintf("[red]%v", err))
 		return
 	}
-	a.showTextPage("describe", fmt.Sprintf(" %s: %s ", ref.kind, ref.name), string(pretty))
+	text := string(pretty)
+	if ref.kind == viewSecrets {
+		// Docker secrets are write-only by design: the payload is encrypted at
+		// rest and never returned by the API, even to admins. Only metadata
+		// (name, labels, timestamps) is accessible.
+		text += "\n\n// Note: the secret VALUE is not retrievable via the Docker API.\n// It is encrypted at rest and exposed only inside authorised containers\n// (mounted at /run/secrets/<name>)."
+	}
+	a.showTextPage("describe", fmt.Sprintf(" %s: %s ", ref.kind, ref.name), text)
 }
 
 // --- Logs ------------------------------------------------------------------------
@@ -233,45 +250,86 @@ func (a *App) handleLogs() {
 
 	switch ref.kind {
 	case viewContainers:
-		a.streamContainerLogs(ref.name, []string{ref.id})
+		// Tasks view: stream via the parent service (works across all nodes).
+		if ref.serviceID == "" {
+			a.setStatus("[yellow]no service associated with this task")
+			return
+		}
+		a.streamServiceLogs(ref.name, []string{ref.serviceID})
 	case viewServices:
-		ctx, cancel := a.ctx()
-		defer cancel()
-		ids, err := a.store.ServiceTaskContainerIDs(ctx, ref.id)
-		if err != nil {
-			a.setStatus(fmt.Sprintf("[red]%v", err))
-			return
-		}
-		if len(ids) == 0 {
-			a.setStatus("[yellow]no running tasks for this service")
-			return
-		}
-		a.streamContainerLogs(ref.name, ids)
+		// Use ServiceLogs: the manager aggregates logs from all task replicas,
+		// even those running on worker nodes the client cannot reach directly.
+		a.streamServiceLogs(ref.name, []string{ref.id})
 	case viewStacks:
 		ctx, cancel := a.ctx()
 		defer cancel()
-		ids, err := a.store.StackContainerIDs(ctx, ref.id)
+		services, err := a.store.ServicesInStack(ctx, ref.id)
 		if err != nil {
 			a.setStatus(fmt.Sprintf("[red]%v", err))
 			return
 		}
-		if len(ids) == 0 {
-			a.setStatus("[yellow]no running tasks for this stack")
+		if len(services) == 0 {
+			a.setStatus("[yellow]no services for this stack")
 			return
 		}
-		a.streamContainerLogs(ref.name, ids)
+		ids := make([]string, len(services))
+		for i, svc := range services {
+			ids[i] = svc.ID
+		}
+		a.streamServiceLogs(ref.name, ids)
 	default:
 		a.setStatus("[yellow]logs (l) only applies to containers/services/stacks")
 	}
 }
 
-// streamContainerLogs opens a fullscreen scrolling view tailing logs from one
-// or more containers, prefixing each line with the source container's short
-// ID when more than one is being aggregated.
-func (a *App) streamContainerLogs(title string, containerIDs []string) {
-	view := tview.NewTextView().SetDynamicColors(false).SetMaxLines(5000)
-	view.SetChangedFunc(func() { a.tv.Draw() })
-	view.SetBorder(true).SetTitle(fmt.Sprintf(" logs: %s ", title))
+// openLogView creates the fullscreen log view: a bordered Flex containing the
+// log TextView and a one-line shortcut bar (k9s-style). Default: FOLLOW ON
+// (auto-scroll to newest line). Keys: f=toggle follow, w=toggle wrap, Esc=close.
+//
+// NOTE: never call a.tv.Draw() from inside InputCapture — that runs on the
+// tview event goroutine which already holds the screen lock, causing a
+// deadlock. tview redraws automatically after every InputCapture return.
+func (a *App) openLogView(title string) (*tview.TextView, context.Context, context.CancelFunc) {
+	follow := true // accessed only on tview main goroutine (closures below)
+	wrap := false  // wrap off by default so long log lines are not broken
+
+	view := tview.NewTextView().SetDynamicColors(false).SetMaxLines(10000)
+	view.SetWrap(wrap)
+	view.SetBorder(false)
+
+	bar := tview.NewTextView().SetDynamicColors(true)
+
+	renderBar := func() {
+		fFg, fBg := "white", "teal"
+		if !follow {
+			fFg, fBg = "white", "grey"
+		}
+		wFg, wBg := "white", "grey"
+		if wrap {
+			wFg, wBg = "white", "teal"
+		}
+		bar.SetText(fmt.Sprintf(
+			"  [%s:%s:b] f [-:-:-] [white]%-6s[-]   [%s:%s:b] w [-:-:-] [white]%-4s[-]   [white:grey:b] Esc [-:-:-] [white]CLOSE[-]",
+			fFg, fBg, "FOLLOW",
+			wFg, wBg, "WRAP",
+		))
+	}
+	renderBar()
+
+	outer := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(view, 0, 1, true).
+		AddItem(bar, 1, 0, false)
+	outer.SetBorder(true).SetTitle(fmt.Sprintf(" logs: %s ", title))
+
+	// SetChangedFunc runs on the main goroutine (inside QueueUpdateDraw).
+	// Calling ScrollToEnd here is safe; calling Draw here is also safe because
+	// we are in a queued update, not inside an active draw lock.
+	view.SetChangedFunc(func() {
+		if follow {
+			view.ScrollToEnd()
+		}
+		a.tv.Draw()
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	view.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
@@ -281,16 +339,48 @@ func (a *App) streamContainerLogs(title string, containerIDs []string) {
 			a.tv.SetFocus(a.table)
 			return nil
 		}
+		switch event.Rune() {
+		case 'f', 'F':
+			follow = !follow
+			if follow {
+				view.ScrollToEnd()
+			}
+			renderBar()
+			// Return nil — tview redraws after InputCapture; do NOT call Draw() here.
+			return nil
+		case 'w', 'W':
+			wrap = !wrap
+			view.SetWrap(wrap)
+			renderBar()
+			return nil
+		}
 		return event
 	})
 
-	a.pages.AddPage("logs", view, true, true)
+	a.pages.AddPage("logs", outer, true, true)
 	a.tv.SetFocus(view)
+	return view, ctx, cancel
+}
 
+// streamContainerLogs tails logs from one or more local containers, prefixing
+// each line with the short container ID when aggregating more than one.
+func (a *App) streamContainerLogs(title string, containerIDs []string) {
+	view, ctx, _ := a.openLogView(title)
 	multiplex := len(containerIDs) > 1
 	for _, id := range containerIDs {
 		id := id
 		go a.tailOne(ctx, view, id, multiplex)
+	}
+}
+
+// streamServiceLogs tails logs via the Swarm ServiceLogs API (manager-side
+// aggregation), so replicas on worker nodes are included.
+func (a *App) streamServiceLogs(title string, serviceIDs []string) {
+	view, ctx, _ := a.openLogView(title)
+	multiplex := len(serviceIDs) > 1
+	for _, id := range serviceIDs {
+		id := id
+		go a.tailOneService(ctx, view, id, multiplex)
 	}
 }
 
@@ -311,6 +401,40 @@ func (a *App) tailOne(ctx context.Context, view *tview.TextView, containerID str
 	// the container was started without a TTY; stdcopy understands both
 	// framed and raw streams transparently is not guaranteed, so we try a
 	// scanner first and fall back gracefully for already-demultiplexed data.
+	pr, pw := io.Pipe()
+	go func() {
+		defer pw.Close()
+		_, _ = stdcopy.StdCopy(pw, pw, rc)
+	}()
+
+	scanner := bufio.NewScanner(pr)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		a.tv.QueueUpdateDraw(func() { fmt.Fprintf(view, "%s%s\n", prefix, line) })
+	}
+}
+
+func (a *App) tailOneService(ctx context.Context, view *tview.TextView, serviceID string, prefixSource bool) {
+	rc, err := a.store.ServiceLogs(ctx, serviceID, true)
+	if err != nil {
+		a.tv.QueueUpdateDraw(func() {
+			fmt.Fprintf(view, "[error opening logs for service %s: %v]\n", serviceID, err)
+		})
+		return
+	}
+	defer rc.Close()
+
+	prefix := ""
+	if prefixSource {
+		prefix = serviceID[:min(12, len(serviceID))] + " | "
+	}
+
 	pr, pw := io.Pipe()
 	go func() {
 		defer pw.Close()
@@ -361,12 +485,14 @@ func (a *App) handleEnter() {
 	if ref == nil {
 		return
 	}
-	if ref.kind == viewStacks {
-		// Drill from a stack into its services, pre-filtered would be nicer;
-		// for now we just jump to the services view (still grouped by the
-		// STACK column) and let the user look it over.
+	switch ref.kind {
+	case viewStacks:
+		// Drill into services filtered by this stack.
 		a.switchView(viewServices)
-		return
+	case viewServices, viewContainers:
+		// Default action for services/tasks is to show logs.
+		a.handleLogs()
+	default:
+		a.handleDescribe()
 	}
-	a.handleDescribe()
 }

@@ -13,9 +13,11 @@ import (
 // handlers (delete/logs/scale/describe) know what the selected row refers
 // to without re-parsing displayed strings.
 type rowMeta struct {
-	kind viewName
-	id   string
-	name string
+	kind        viewName
+	id          string
+	name        string
+	serviceID   string // tasks: parent service ID (used for ServiceLogs)
+	containerID string // tasks: underlying container ID (used for ContainerRemove)
 }
 
 func (a *App) refreshCurrent() error {
@@ -113,39 +115,44 @@ func serviceModeAndReplicas(svc swarm.Service) (mode string, replicas string) {
 		running := svc.ServiceStatus.RunningTasks
 		return "replicated", fmt.Sprintf("%d/%d", running, desired)
 	case svc.Spec.Mode.Global != nil:
-		return "global", fmt.Sprintf("%d", svc.ServiceStatus.RunningTasks)
+		// DesiredTasks is computed by the Swarm manager as the number of
+		// eligible nodes, so it works correctly without listing nodes manually.
+		return "global", fmt.Sprintf("%d/%d", svc.ServiceStatus.RunningTasks, svc.ServiceStatus.DesiredTasks)
 	default:
 		return "unknown", "-"
 	}
 }
 
-// --- Containers ----------------------------------------------------------------
+// --- Containers (Swarm tasks) -----------------------------------------------
+// Uses TaskList (manager API) to show containers across ALL nodes, not just
+// those running on the connected manager daemon.
 
 func (a *App) refreshContainers() error {
 	ctx, cancel := a.ctx()
 	defer cancel()
-	containers, err := a.store.Containers(ctx)
+	tasks, err := a.store.AllTasks(ctx)
 	if err != nil {
 		return err
 	}
 
-	setHeaderRow(a.table, "NAME", "IMAGE", "STATE", "STATUS", "NODE", "ID")
-	for i, c := range containers {
+	setHeaderRow(a.table, "NAME", "SERVICE", "NODE", "STATE", "IMAGE", "ID")
+	for i, t := range tasks {
 		row := i + 1
-		name := ""
-		if len(c.Names) > 0 {
-			name = c.Names[0]
+		ref := &rowMeta{
+			kind:        viewContainers,
+			id:          t.ID,
+			name:        t.Name,
+			serviceID:   t.ServiceID,
+			containerID: t.ContainerID,
 		}
-		node := c.Labels["com.docker.swarm.node.id"]
-		ref := &rowMeta{kind: viewContainers, id: c.ID, name: name}
-		setCell(a.table, row, 0, name, ref)
-		setCell(a.table, row, 1, c.Image, nil)
-		setCell(a.table, row, 2, c.State, nil)
-		setCell(a.table, row, 3, c.Status, nil)
-		setCell(a.table, row, 4, dockerx.ShortID(node), nil)
-		setCell(a.table, row, 5, dockerx.ShortID(c.ID), nil)
+		setCell(a.table, row, 0, t.Name, ref)
+		setCell(a.table, row, 1, t.ServiceName, nil)
+		setCell(a.table, row, 2, t.NodeName, nil)
+		setCell(a.table, row, 3, t.State, nil)
+		setCell(a.table, row, 4, t.Image, nil)
+		setCell(a.table, row, 5, dockerx.ShortID(t.ID), nil)
 	}
-	a.setStatus(fmt.Sprintf("%d containers", len(containers)))
+	a.setStatus(fmt.Sprintf("%d tasks (cluster-wide)", len(tasks)))
 	return nil
 }
 
@@ -159,13 +166,15 @@ func (a *App) refreshStacks() error {
 		return err
 	}
 
-	setHeaderRow(a.table, "NAME", "SERVICES", "TASKS")
+	// SERVICES = "ok/total" (services where running >= desired)
+	// REPLICAS = "running/desired" (aggregate across all services in the stack)
+	setHeaderRow(a.table, "NAME", "SERVICES", "REPLICAS")
 	for i, st := range stacks {
 		row := i + 1
 		ref := &rowMeta{kind: viewStacks, id: st.Name, name: st.Name}
 		setCell(a.table, row, 0, st.Name, ref)
-		setCell(a.table, row, 1, fmt.Sprintf("%d", st.Services), nil)
-		setCell(a.table, row, 2, fmt.Sprintf("%d", st.Tasks), nil)
+		setCell(a.table, row, 1, fmt.Sprintf("%d/%d", st.ServicesOK, st.Services), nil)
+		setCell(a.table, row, 2, fmt.Sprintf("%d/%d", st.ReplicasRunning, st.ReplicasDesired), nil)
 	}
 	a.setStatus(fmt.Sprintf("%d stacks", len(stacks)))
 	return nil
@@ -184,9 +193,13 @@ func (a *App) refreshNodes() error {
 	setHeaderRow(a.table, "HOSTNAME", "ROLE", "AVAILABILITY", "STATUS", "ENGINE", "ID")
 	for i, n := range nodes {
 		row := i + 1
+		role := string(n.Spec.Role)
+		if n.ManagerStatus != nil && n.ManagerStatus.Leader {
+			role = "leader"
+		}
 		ref := &rowMeta{kind: viewNodes, id: n.ID, name: n.Description.Hostname}
 		setCell(a.table, row, 0, n.Description.Hostname, ref)
-		setCell(a.table, row, 1, string(n.Spec.Role), nil)
+		setCell(a.table, row, 1, role, nil)
 		setCell(a.table, row, 2, string(n.Spec.Availability), nil)
 		setCell(a.table, row, 3, string(n.Status.State), nil)
 		setCell(a.table, row, 4, n.Description.Engine.EngineVersion, nil)

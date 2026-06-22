@@ -12,6 +12,7 @@ import (
 	"github.com/docker/docker/api/types/swarm"
 )
 
+
 const stackLabel = "com.docker.stack.namespace"
 
 // Store provides the read/action operations the UI views need, on top of a
@@ -37,46 +38,42 @@ func (s *Store) Nodes(ctx context.Context) ([]swarm.Node, error) {
 
 // --- Stacks ------------------------------------------------------------------
 
-// StackSummary aggregates the services/tasks belonging to one stack
-// (identified by the com.docker.stack.namespace label).
+// StackSummary aggregates health metrics for one stack.
 type StackSummary struct {
-	Name     string
-	Services int
-	Tasks    int
+	Name            string
+	Services        int    // total number of services
+	ServicesOK      int    // services where running >= desired (fully healthy)
+	ReplicasDesired uint64 // sum of desired replicas across all services
+	ReplicasRunning uint64 // sum of currently running tasks across all services
 }
 
+// Stacks builds one StackSummary per com.docker.stack.namespace group using
+// ServiceStatus (no separate TaskList call needed).
 func (s *Store) Stacks(ctx context.Context) ([]StackSummary, error) {
-	services, err := s.conn.Client.ServiceList(ctx, types.ServiceListOptions{})
+	// Status:true populates ServiceStatus.RunningTasks / DesiredTasks.
+	services, err := s.conn.Client.ServiceList(ctx, types.ServiceListOptions{Status: true})
 	if err != nil {
 		return nil, fmt.Errorf("listing services: %w", err)
 	}
-	tasks, err := s.conn.Client.TaskList(ctx, types.TaskListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("listing tasks: %w", err)
-	}
 
 	byStack := map[string]*StackSummary{}
-	serviceStack := map[string]string{}
 	for _, svc := range services {
 		name := svc.Spec.Labels[stackLabel]
 		if name == "" {
 			name = "(none)"
 		}
-		serviceStack[svc.ID] = name
 		entry, ok := byStack[name]
 		if !ok {
 			entry = &StackSummary{Name: name}
 			byStack[name] = entry
 		}
 		entry.Services++
-	}
-	for _, t := range tasks {
-		name := serviceStack[t.ServiceID]
-		if name == "" {
-			name = "(none)"
-		}
-		if entry, ok := byStack[name]; ok {
-			entry.Tasks++
+		running := svc.ServiceStatus.RunningTasks
+		desired := svc.ServiceStatus.DesiredTasks
+		entry.ReplicasRunning += running
+		entry.ReplicasDesired += desired
+		if running >= desired {
+			entry.ServicesOK++
 		}
 	}
 
@@ -207,6 +204,89 @@ func (s *Store) RemoveService(ctx context.Context, serviceID string) error {
 
 // --- Containers / Tasks ------------------------------------------------------
 
+// TaskInfo holds resolved Swarm task information (service and node names
+// already expanded), so the UI layer doesn't need extra API calls.
+type TaskInfo struct {
+	ID          string
+	Name        string // "serviceName.slot" (replicated) or "serviceName.shortID" (global)
+	ServiceID   string
+	ServiceName string
+	NodeName    string
+	State       string
+	Image       string
+	ContainerID string
+}
+
+// AllTasks returns all Swarm tasks whose desired state is "running", with
+// service and node names resolved. This gives a cluster-wide view of every
+// container without having to SSH into individual worker nodes.
+func (s *Store) AllTasks(ctx context.Context) ([]TaskInfo, error) {
+	tasks, err := s.conn.Client.TaskList(ctx, types.TaskListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("listing tasks: %w", err)
+	}
+	services, err := s.conn.Client.ServiceList(ctx, types.ServiceListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("listing services: %w", err)
+	}
+	nodes, err := s.conn.Client.NodeList(ctx, types.NodeListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("listing nodes: %w", err)
+	}
+
+	svcNames := make(map[string]string, len(services))
+	for _, svc := range services {
+		svcNames[svc.ID] = svc.Spec.Name
+	}
+	nodeNames := make(map[string]string, len(nodes))
+	for _, n := range nodes {
+		nodeNames[n.ID] = n.Description.Hostname
+	}
+
+	var infos []TaskInfo
+	for _, t := range tasks {
+		// Only show tasks the scheduler intends to keep running.
+		if t.DesiredState != swarm.TaskStateRunning {
+			continue
+		}
+		svcName := svcNames[t.ServiceID]
+		containerID := ""
+		image := ""
+		if t.Status.ContainerStatus != nil {
+			containerID = t.Status.ContainerStatus.ContainerID
+		}
+		if t.Spec.ContainerSpec != nil {
+			image = t.Spec.ContainerSpec.Image
+			// Strip the sha256 digest from the image name.
+			if idx := strings.Index(image, "@"); idx != -1 {
+				image = image[:idx]
+			}
+		}
+		name := fmt.Sprintf("%s.%d", svcName, t.Slot)
+		if t.Slot == 0 {
+			// Global service tasks have no slot; use a short task ID suffix.
+			name = fmt.Sprintf("%s.%s", svcName, ShortID(t.ID))
+		}
+		infos = append(infos, TaskInfo{
+			ID:          t.ID,
+			Name:        name,
+			ServiceID:   t.ServiceID,
+			ServiceName: svcName,
+			NodeName:    nodeNames[t.NodeID],
+			State:       string(t.Status.State),
+			Image:       image,
+			ContainerID: containerID,
+		})
+	}
+	sort.Slice(infos, func(i, j int) bool {
+		if infos[i].ServiceName != infos[j].ServiceName {
+			return infos[i].ServiceName < infos[j].ServiceName
+		}
+		return infos[i].Name < infos[j].Name
+	})
+	return infos, nil
+}
+
 func (s *Store) Containers(ctx context.Context) ([]types.Container, error) {
 	containers, err := s.conn.Client.ContainerList(ctx, types.ContainerListOptions{All: true})
 	if err != nil {
@@ -266,6 +346,19 @@ func (s *Store) RemoveSecret(ctx context.Context, id string) error {
 // ContainerLogs streams raw (multiplexed) logs for a single container.
 func (s *Store) ContainerLogs(ctx context.Context, containerID string, follow bool) (io.ReadCloser, error) {
 	return s.conn.Client.ContainerLogs(ctx, containerID, types.ContainerLogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Follow:     follow,
+		Tail:       "200",
+		Timestamps: true,
+	})
+}
+
+// ServiceLogs streams logs for all tasks of a service through the Swarm
+// manager, avoiding the "container not found" error that occurs when tasks
+// run on worker nodes other than the connected manager.
+func (s *Store) ServiceLogs(ctx context.Context, serviceID string, follow bool) (io.ReadCloser, error) {
+	return s.conn.Client.ServiceLogs(ctx, serviceID, types.ContainerLogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     follow,

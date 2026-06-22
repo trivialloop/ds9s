@@ -1,6 +1,6 @@
 module ds9s
 
-go 1.22.2
+go 1.25.0
 
 require (
 	github.com/docker/docker v24.0.9+incompatible
@@ -20,6 +20,8 @@ require (
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/lucasb-eyer/go-colorful v1.2.0 // indirect
 	github.com/mattn/go-runewidth v0.0.16 // indirect
+	github.com/moby/term v0.5.2 // indirect
+	github.com/morikuni/aec v1.1.0 // indirect
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.1 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
@@ -27,4 +29,6 @@ require (
 	golang.org/x/sys v0.29.0 // indirect
 	golang.org/x/term v0.28.0 // indirect
 	golang.org/x/text v0.21.0 // indirect
+	golang.org/x/time v0.15.0 // indirect
+	gotest.tools/v3 v3.5.2 // indirect
 )

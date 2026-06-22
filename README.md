@@ -5,22 +5,16 @@ A [k9s](https://github.com/derailed/k9s)-inspired terminal UI for **Docker Swarm
 Connects to one Swarm manager at a time (local socket, TCP+TLS, or through an
 SSH hop — including a proxy-jump) and lets you browse and act on:
 
-- **services** (scale, force-update/restart, delete, logs)
-- **containers / tasks** (delete, logs, inspect)
-- **stacks** (delete the whole stack: services + their networks/configs/secrets, logs aggregated across the stack)
-- **nodes** (read-only overview)
-- **configs** / **secrets** (list, inspect metadata, delete)
+- **services** — scale, force-update/restart, delete, logs (all replicas)
+- **containers / tasks** — cluster-wide view across all nodes, logs, delete, inspect
+- **stacks** — health summary (services ok/total, replicas running/desired), delete entire stack
+- **nodes** — read-only overview with leader indicator
+- **configs** / **secrets** — list, inspect metadata, delete
 
 ## Build
 
 ```bash
-go build -o ds9s .
-```
-
-Requires Go 1.22+ and normal internet access (to fetch modules):
-
-```bash
-go mod tidy   # only needed once, to (re)generate go.sum on your machine
+go mod tidy   # only needed once, to (re)generate go.sum
 go build -o ds9s .
 ```
 
@@ -58,9 +52,9 @@ managers:
 
 For the SSH case, ds9s opens the SSH session itself (optionally hopping
 through `proxyJump` first) and runs `docker system dial-stdio` on the
-manager — the same trick the docker CLI itself uses for `ssh://` hosts —
-using that as the transport for every API call. Nothing needs to be exposed
-on the network beyond SSH itself.
+manager — the same trick the docker CLI uses for `ssh://` hosts — using that
+as the transport for every API call. Nothing needs to be exposed on the
+network beyond SSH itself.
 
 If your SSH user isn't in the manager's `docker` group, set `sudo: true`.
 Because ds9s can't answer an interactive password prompt, this requires
@@ -79,35 +73,93 @@ Run with a specific manager without touching the config:
 
 ## Usage
 
-Command bar (press `:`):
+### Command bar (press `:`)
+
+The command bar supports **autocomplete**: type a few letters and suggestions
+appear; use arrow keys to navigate them.
 
 | Command | View |
 |---|---|
 | `:services` / `:svc` | Services |
-| `:containers` / `:co` / `:ps` | Containers / tasks |
-| `:stacks` | Stacks |
-| `:nodes` | Nodes |
-| `:configs` | Configs |
-| `:secrets` | Secrets |
+| `:containers` / `:co` / `:ps` | Containers / tasks (cluster-wide) |
+| `:stacks` / `:stk` | Stacks |
+| `:nodes` / `:no` | Nodes |
+| `:configs` / `:cm` | Configs |
+| `:secrets` / `:sec` | Secrets |
+| `:alias` | List all commands and shortcuts |
+| `:context` | Interactive manager switcher (arrow keys + Enter) |
+| `:context <name>` | Switch directly to a named manager |
 | `:quit` / `:q` | Quit |
 
-Keys (on the table, not in the command bar):
+### Keys (on the main table)
 
 | Key | Action |
 |---|---|
-| `Enter` | Inspect / drill in |
-| `l` | Logs (container: itself; service: all its tasks; stack: all its services' tasks) |
-| `d` | Describe (raw JSON inspect) |
-| `s` | Scale a service (prompts for replica count) |
+| `Enter` | **Logs** for services/tasks (default); describe for other resources; drill into stack |
+| `d` | Describe — raw JSON inspect |
+| `l` | Logs (container: itself; service: all replicas; stack: all services) |
+| `s` | Scale a service (prompt for replica count) |
 | `u` | Force-update a service (rolling restart, no spec change) |
-| `Ctrl-D` | Delete the selected resource, with confirmation |
+| `Ctrl-D` | Delete selected resource (with confirmation) |
 | `r` | Force refresh |
 | `?` | Help |
 | `q` | Quit |
+| `Esc` | Close current overlay / go back |
 
-Deleting a **stack** removes every service carrying its
-`com.docker.stack.namespace` label, plus the networks/configs/secrets scoped
-to it — mirroring `docker stack rm`.
+### Log viewer
+
+When viewing logs (press `l` or `Enter` on a service/task):
+
+| Key | Action |
+|---|---|
+| `f` / `F` | Toggle **FOLLOW** mode (default: on). Follow auto-scrolls to newest lines; Pause lets you scroll back freely |
+| `w` / `W` | Toggle **WRAP** mode (default: off). Wrap breaks long lines to fit the terminal width |
+| `Esc` | Close log view |
+
+A shortcut bar at the bottom of the log window shows the current state of each toggle
+(teal = active, grey = inactive).
+
+The log view loads the last 200 lines and then streams new lines in real time
+(equivalent to `docker service logs --tail 200 -f`).
+
+> **Secrets**: Docker secret *values* are write-only by design — the payload
+> is encrypted at rest and the API never returns it, even to managers. Only
+> metadata (name, labels, timestamps) is accessible. The secret value is
+> available only inside authorised containers at `/run/secrets/<name>`.
+
+## Views
+
+### Services
+Columns: `NAME · MODE · REPLICAS · IMAGE · STACK · ID`
+
+- Replicated mode: `REPLICAS` shows `running/desired` (e.g. `3/3`).
+- Global mode: `REPLICAS` shows `running/desired` where desired = number of eligible nodes.
+
+### Containers / Tasks
+Cluster-wide Swarm task list (uses the manager's TaskList API — no need to
+SSH into worker nodes). Only tasks whose *desired state* is `running` are
+shown. Columns: `NAME · SERVICE · NODE · STATE · IMAGE · ID`
+
+### Stacks
+Columns: `NAME · SERVICES · REPLICAS`
+
+- `SERVICES` = `healthy/total` — a service is healthy when running ≥ desired replicas.
+- `REPLICAS` = `running/desired` — aggregate across all services in the stack.
+
+### Nodes
+Columns: `HOSTNAME · ROLE · AVAILABILITY · STATUS · ENGINE · ID`
+
+The `ROLE` column shows `leader` for the current Raft leader, `manager` for
+non-leader managers, and `worker` for worker nodes.
+
+## Switching managers (`:context`)
+
+Multiple managers can be configured in the YAML. Press `:` then type
+`context` (or `ctx`) to open an interactive list. Use `↑`/`↓` to navigate
+and `Enter` to switch. The UI reconnects in the background; SSH tunnels are
+re-established transparently.
+
+You can also switch directly: `:context prod-manager2`.
 
 ## Project layout
 
@@ -120,17 +172,14 @@ internal/ui/                tview application: command bar, resource tables,
                              actions (delete/scale/logs/describe), modals
 ```
 
-## Known limitations / next steps
+## Known limitations
 
-- Stacks are reconstructed from the `com.docker.stack.namespace` label rather
-  than read from a `docker-compose.yml` — ds9s never deploys stacks, only
-  inspects/removes what's already running, same as k9s never creates
-  Kubernetes objects.
-- No live "watch" — Swarm's API doesn't expose one, so views poll on
-  `refreshRate` (default 2s) plus manual `r`.
-- Multi-manager: you connect to one manager per ds9s session; switching
-  managers means relaunching with `--manager <name>` for now (an in-app
-  `:context` switcher would be a natural follow-up, the same way k9s switches
-  Kubernetes contexts).
+- Stacks are reconstructed from the `com.docker.stack.namespace` label — ds9s
+  never deploys stacks, only inspects/removes what is already running.
+- No live "watch" — Swarm's API does not expose one; views poll on
+  `refreshRate` (default 2 s) plus manual `r`.
+- Container deletion in the tasks view only works for containers running on the
+  currently connected manager node; worker-node containers will return "not
+  found" (by design — use service delete/scale instead).
 - No xray-style tree view of stack → service → task yet (`Enter` on a stack
-  just jumps to the services view for now).
+  jumps to the services view for now).
