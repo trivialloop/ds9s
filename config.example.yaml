@@ -1,0 +1,57 @@
+# ds9s configuration example.
+# Copy to ~/.config/ds9s/config.yaml (or pass --config /path/to/this/file).
+
+current: prod-manager1
+refreshRate: 2 # seconds between automatic refreshes
+
+managers:
+  # Local docker socket (the machine running ds9s IS a manager, or you've
+  # already forwarded a remote socket here yourself).
+  - name: local
+    host: unix:///var/run/docker.sock
+
+  # Direct TCP connection with mutual TLS to a remote manager
+  # (dockerd -H tcp://0.0.0.0:2376 --tlsverify ...).
+  - name: prod-manager-tcp
+    host: tcp://10.0.0.10:2376
+    tls:
+      ca: /home/me/.docker/ca.pem
+      cert: /home/me/.docker/cert.pem
+      key: /home/me/.docker/key.pem
+
+  # Reach a manager's docker daemon through an SSH hop. ds9s runs
+  # `docker system dial-stdio` over the SSH session (the same trick the
+  # docker CLI itself uses for ssh:// hosts) and uses that as the transport
+  # for every API call; nothing needs to be exposed on the network beyond
+  # SSH. If your ssh user is already in the `docker` group on the remote
+  # host, this is all you need:
+  - name: prod-manager1
+    ssh:
+      addr: manager1.example.com:22
+      user: deploy
+      privateKey: ~/.ssh/id_ed25519
+      # password: "use this OR privateKey, not both"
+      # passphrase: "if your private key is encrypted"
+      # knownHosts: ~/.ssh/known_hosts   # omit to skip host key verification
+
+  # If your ssh user is NOT in the `docker` group and you must go through
+  # sudo instead, set sudo: true. This requires passwordless sudo rights for
+  # docker on the remote host, since ds9s can't answer an interactive sudo
+  # password prompt, e.g. in /etc/sudoers on the manager:
+  #   deploy ALL=(root) NOPASSWD: /usr/bin/docker
+  - name: prod-manager-sudo
+    ssh:
+      addr: manager1.example.com:22
+      user: deploy
+      privateKey: ~/.ssh/id_ed25519
+      sudo: true
+      # remoteSocket: /var/run/docker.sock  # only if the daemon uses a non-default socket
+
+  # Same idea, but reached through a bastion/jump host first.
+  - name: prod-manager-via-bastion
+    ssh:
+      addr: manager2.internal:22 # resolved FROM the jump host
+      proxyJump: bastion.example.com:22
+      user: deploy
+      privateKey: ~/.ssh/id_ed25519
+      sudo: true
