@@ -66,6 +66,10 @@ type App struct {
 	// containers view filter: false = running only (default), true = running + stopped
 	containersShowAll bool
 
+	// text filter — applied on every refresh to skip non-matching rows
+	filterText string
+	filterBar  *tview.InputField
+
 	// cached rendered text — only update widgets when content actually changes
 	// to prevent unnecessary screen redraws (flicker) during auto-refresh.
 	lastHeaderText string
@@ -166,8 +170,35 @@ func (a *App) build() {
 
 	a.hints = tview.NewTextView().SetDynamicColors(true)
 
+	a.filterBar = tview.NewInputField().SetLabel("[yellow]/[-] ")
+	a.filterBar.SetLabelWidth(3)
+	a.filterBar.SetFieldBackgroundColor(tcell.ColorBlack)
+	a.filterBar.SetChangedFunc(func(text string) {
+		a.filterText = text
+		a.table.Clear()
+		a.lastHeaderText = "" // force header refresh (filter badge)
+		if err := a.refreshCurrent(); err != nil {
+			a.setStatus(fmt.Sprintf("[red]%v", err))
+		}
+	})
+	a.filterBar.SetDoneFunc(func(key tcell.Key) {
+		if key == tcell.KeyEscape {
+			a.filterText = ""
+			a.filterBar.SetText("")
+			a.table.Clear()
+			a.lastHeaderText = ""
+			if err := a.refreshCurrent(); err != nil {
+				a.setStatus(fmt.Sprintf("[red]%v", err))
+			}
+		}
+		// Hide the filter bar and return focus to the table.
+		a.root.ResizeItem(a.filterBar, 0, 0)
+		a.tv.SetFocus(a.table)
+	})
+
 	a.root = tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(a.header, 1, 0, false).
+		AddItem(a.filterBar, 0, 0, false). // hidden until '/' is pressed
 		AddItem(a.table, 0, 1, true).
 		AddItem(a.hints, 1, 0, false).
 		AddItem(a.cmdInput, 1, 0, false).
@@ -277,6 +308,10 @@ func (a *App) globalKeys(event *tcell.EventKey) *tcell.EventKey {
 	case 'k':
 		a.handleKill()
 		return nil
+	case '/':
+		a.root.ResizeItem(a.filterBar, 1, 0)
+		a.tv.SetFocus(a.filterBar)
+		return nil
 	case 'f':
 		if a.current == viewContainers {
 			a.containersShowAll = !a.containersShowAll
@@ -327,6 +362,11 @@ func (a *App) runCommand(cmdline string) {
 
 func (a *App) switchView(vn viewName) {
 	a.current = vn
+	// Clear any active text filter when switching views.
+	a.filterText = ""
+	a.filterBar.SetText("")
+	a.root.ResizeItem(a.filterBar, 0, 0)
+	a.lastHeaderText = ""
 	// Full reset when switching views: clear the table so cells from the
 	// previous view don't bleed through, and reset scroll to the top-left.
 	a.table.Clear()
@@ -339,6 +379,9 @@ func (a *App) switchView(vn viewName) {
 func (a *App) refreshHeader() {
 	text := fmt.Sprintf(" [yellow::b]ds9s[-:-:-]  manager:[green]%s[-]  host:[grey]%s[-]  view:[aqua]%s[-]",
 		a.conn.Manager.Name, a.conn.Manager.Host, a.current)
+	if a.filterText != "" {
+		text += fmt.Sprintf("  filter:[orange]%s[-]", tview.Escape(a.filterText))
+	}
 	if text != a.lastHeaderText {
 		a.lastHeaderText = text
 		a.header.SetText(text)
@@ -353,7 +396,7 @@ func (a *App) updateHints() {
 		return fmt.Sprintf("[black:teal:b] %s [-:-:-] [white]%s[-]", key, label)
 	}
 	// Common hints present on every view.
-	common := "  " + chip("r", "REFRESH") + "   " + chip("?", "HELP") + "   " + chip("q", "QUIT")
+	common := "  " + chip("/", "FILTER") + "   " + chip("r", "REFRESH") + "   " + chip("?", "HELP") + "   " + chip("q", "QUIT")
 
 	var extra string
 	switch a.current {

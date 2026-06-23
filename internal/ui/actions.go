@@ -21,20 +21,59 @@ import (
 	"ds9s/internal/dockerx"
 )
 
-// confirm shows a yes/no modal and runs onYes if the user confirms.
+// confirm shows a confirmation dialog and runs onYes if the user presses Enter.
+// Esc cancels. The dialog uses explicit key-hint chips instead of tview buttons
+// so there is no ambiguity about which button is "selected".
 func (a *App) confirm(question string, onYes func()) {
-	modal := tview.NewModal().
-		SetText(question).
-		AddButtons([]string{"Cancel", "Confirm"}).
-		SetDoneFunc(func(idx int, label string) {
-			a.pages.RemovePage("confirm")
-			a.tv.SetFocus(a.table)
-			if label == "Confirm" {
-				onYes()
-			}
-		})
-	a.pages.AddPage("confirm", modal, true, true)
-	a.tv.SetFocus(modal)
+	dismissed := false
+	dismiss := func() {
+		if dismissed {
+			return
+		}
+		dismissed = true
+		a.pages.RemovePage("confirm")
+		a.tv.SetFocus(a.table)
+	}
+
+	chip := func(key, label string) string {
+		return fmt.Sprintf("[black:teal:b] %s [-:-:-] [white]%s[-]", key, label)
+	}
+	body := "\n" + tview.Escape(question) + "\n\n" +
+		chip("Enter", "CONFIRM") + "   " + chip("Esc", "CANCEL")
+
+	view := tview.NewTextView().
+		SetDynamicColors(true).
+		SetWrap(true).
+		SetText(body).
+		SetTextAlign(tview.AlignCenter)
+	view.SetBorder(true).
+		SetTitle(" Confirm ").
+		SetBorderColor(tcell.ColorOrange)
+	view.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEnter:
+			dismiss()
+			onYes()
+			return nil
+		case tcell.KeyEscape:
+			dismiss()
+			return nil
+		}
+		return event
+	})
+
+	// Center a fixed-size dialog over the screen.
+	const dialogW, dialogH = 64, 9
+	dialog := tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 0, 1, false).
+			AddItem(view, dialogH, 0, true).
+			AddItem(nil, 0, 1, false), dialogW, 0, true).
+		AddItem(nil, 0, 1, false)
+
+	a.pages.AddPage("confirm", dialog, true, true)
+	a.tv.SetFocus(view)
 }
 
 // prompt shows a single-line text input modal and calls onSubmit with the
