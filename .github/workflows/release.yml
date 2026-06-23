@@ -1,13 +1,22 @@
 name: release
 
-# Triggered by a manual tag push: git tag v1.2.3 && git push origin v1.2.3
+# Triggered automatically when VERSION changes on the main branch.
+# Workflow:
+#   1. Read version from VERSION file
+#   2. Extract release notes from CHANGELOG.md for that version
+#   3. Build cross-platform binaries
+#   4. Create the git tag and publish a GitHub release
+#
+# To release: bump VERSION, add a ## [x.y.z] section to CHANGELOG.md, push to main.
+
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
+    paths:
+      - VERSION
 
 permissions:
-  contents: write   # needed to create GitHub releases and upload assets
+  contents: write
 
 jobs:
   release:
@@ -17,21 +26,53 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # full history so --generate-notes spans all commits
+          fetch-depth: 0
+
+      - name: Read version
+        id: version
+        run: |
+          VER="$(cat VERSION | tr -d '[:space:]')"
+          echo "version=v${VER}" >> "$GITHUB_OUTPUT"
+          echo "version_bare=${VER}" >> "$GITHUB_OUTPUT"
+          echo "Releasing v${VER}"
+
+      - name: Abort if tag already exists
+        run: |
+          TAG="${{ steps.version.outputs.version }}"
+          if git ls-remote --tags origin "${TAG}" | grep -q .; then
+            echo "::error::Tag ${TAG} already exists — bump VERSION to create a new release."
+            exit 1
+          fi
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod   # honours the `go` directive in go.mod
+          go-version-file: go.mod
 
       - name: Verify go.mod/go.sum are tidy
         run: |
           go mod tidy
           git diff --exit-code go.mod go.sum
 
+      - name: Extract changelog section
+        id: notes
+        run: |
+          VER="${{ steps.version.outputs.version_bare }}"
+          # Escape dots for awk regex
+          VER_ESC=$(printf '%s' "${VER}" | sed 's/\./\\./g')
+          # Extract lines between ## [x.y.z] and the next ## heading
+          awk "/^## \[${VER_ESC}\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md \
+            > /tmp/release_notes.md
+          if [ ! -s /tmp/release_notes.md ]; then
+            echo "No changelog section found for ${VER} — add a ## [${VER}] entry to CHANGELOG.md"
+            echo "(No release notes provided.)" > /tmp/release_notes.md
+          fi
+          echo "--- release notes ---"
+          cat /tmp/release_notes.md
+
       - name: Build binaries
         run: |
-          VERSION="${GITHUB_REF_NAME}"
-          LDFLAGS="-s -w -X main.version=${VERSION}"
+          TAG="${{ steps.version.outputs.version }}"
+          LDFLAGS="-s -w -X main.version=${TAG}"
           mkdir -p dist
 
           for OS in linux darwin; do
@@ -42,22 +83,28 @@ jobs:
             done
           done
 
-          # Windows convenience build
           GOOS=windows GOARCH=amd64 go build \
             -ldflags "${LDFLAGS}" \
             -o dist/ds9s-windows-amd64.exe .
 
           ls -lh dist/
 
-      - name: Create GitHub release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create git tag
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "ds9s ${GITHUB_REF_NAME}" \
-            --generate-notes \
-            dist/ds9s-linux-amd64 \
-            dist/ds9s-linux-arm64 \
-            dist/ds9s-darwin-amd64 \
-            dist/ds9s-darwin-arm64 \
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.version.outputs.version }}"
+          git push origin "${{ steps.version.outputs.version }}"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ds9s ${{ steps.version.outputs.version }}
+          body_path: /tmp/release_notes.md
+          files: |
+            dist/ds9s-linux-amd64
+            dist/ds9s-linux-arm64
+            dist/ds9s-darwin-amd64
+            dist/ds9s-darwin-arm64
             dist/ds9s-windows-amd64.exe
