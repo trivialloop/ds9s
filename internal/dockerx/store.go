@@ -7,6 +7,7 @@ import (
 	"net"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
@@ -219,6 +220,7 @@ type TaskInfo struct {
 	State       string
 	Image       string
 	ContainerID string
+	CreatedAt   time.Time
 }
 
 // AllTasks returns Swarm tasks with service and node names resolved.
@@ -292,6 +294,7 @@ func (s *Store) AllTasks(ctx context.Context, runningOnly bool) ([]TaskInfo, err
 			State:       string(t.Status.State),
 			Image:       image,
 			ContainerID: containerID,
+			CreatedAt:   t.Meta.CreatedAt,
 		})
 	}
 	sort.Slice(infos, func(i, j int) bool {

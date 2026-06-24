@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/docker/docker/api/types/swarm"
 	"github.com/gdamore/tcell/v2"
@@ -10,6 +11,34 @@ import (
 
 	"ds9s/internal/dockerx"
 )
+
+// relativeAge formats a creation timestamp as a compact human-readable age
+// (e.g. "5m", "3h", "12d").
+func relativeAge(t time.Time) string {
+	if t.IsZero() {
+		return "-"
+	}
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd", int(d.Hours()/24))
+	}
+}
+
+// shortImage strips the @sha256:... digest from a Docker image reference so
+// the displayed string is "registry/image:tag" not "…:tag@sha256:abc123".
+func shortImage(image string) string {
+	if i := strings.IndexByte(image, '@'); i != -1 {
+		return image[:i]
+	}
+	return image
+}
 
 // rowMatchesFilter reports whether any of the given values contains the filter
 // string (case-insensitive). An empty filter always matches.
@@ -48,7 +77,7 @@ func (a *App) refreshCurrent() error {
 	// tview's clampSelection from resetting the column offset to 0 during
 	// the subsequent Draw() call.
 	rowOff, colOff := a.table.GetOffset()
-	selRow, selCol := a.table.GetSelection()
+	selRow, _ := a.table.GetSelection()
 	prevRows := a.table.GetRowCount()
 
 	a.refreshHeader()
@@ -82,23 +111,30 @@ func (a *App) refreshCurrent() error {
 	// Blank out rows that are no longer in the dataset (table shrank).
 	// We never call table.Clear() during auto-refresh, so we must erase
 	// the leftover rows from the previous (larger) result set manually.
+	// Make blanked cells non-selectable so the cursor can't land on them.
 	newRows := a.table.GetRowCount()
 	colCount := a.table.GetColumnCount()
 	for row := newRows; row < prevRows; row++ {
 		for col := 0; col < colCount; col++ {
-			a.table.SetCell(row, col, tview.NewTableCell(""))
+			a.table.SetCell(row, col, tview.NewTableCell("").SetSelectable(false))
 		}
 	}
 
-	// Restore scroll and selection. Call Select before SetOffset so that
-	// tview's internal clampSelection (triggered by Select) runs first;
-	// SetOffset then overrides the column offset unconditionally.
+	// Restore scroll and selection.
+	// IMPORTANT: only call Select() when the row is out of bounds.
+	// Select() sets tview's internal clampToSelection flag which can cause
+	// Draw() to readjust columnOffset even with columnsSelectable=false,
+	// resetting the user's horizontal scroll position to 0.
 	rows := a.table.GetRowCount()
 	if rows > 1 {
 		if selRow < 1 || selRow >= rows {
-			selRow = 1
+			if selRow < 1 {
+				selRow = 1
+			} else {
+				selRow = rows - 1
+			}
+			a.table.Select(selRow, 0)
 		}
-		a.table.Select(selRow, selCol)
 		a.table.SetOffset(rowOff, colOff)
 	}
 
@@ -154,14 +190,14 @@ func (a *App) refreshServices() error {
 		return err
 	}
 
-	setHeaderRow(a.table, "NAME", "MODE", "REPLICAS", "IMAGE", "STACK", "ID")
+	setHeaderRow(a.table, "NAME", "MODE", "REPLICAS", "AGE", "IMAGE", "STACK", "ID")
 	row := 1
 	for _, svc := range services {
 		mode, replicas := serviceModeAndReplicas(svc)
 		stack := svc.Spec.Labels["com.docker.stack.namespace"]
 		image := ""
 		if svc.Spec.TaskTemplate.ContainerSpec != nil {
-			image = svc.Spec.TaskTemplate.ContainerSpec.Image
+			image = shortImage(svc.Spec.TaskTemplate.ContainerSpec.Image)
 		}
 		if !rowMatchesFilter(a.filterText, svc.Spec.Name, mode, image, stack) {
 			continue
@@ -170,9 +206,10 @@ func (a *App) refreshServices() error {
 		setCell(a.table, row, 0, svc.Spec.Name, ref)
 		setCell(a.table, row, 1, mode, nil)
 		setCell(a.table, row, 2, replicas, nil)
-		setCell(a.table, row, 3, image, nil)
-		setCell(a.table, row, 4, stack, nil)
-		setCell(a.table, row, 5, dockerx.ShortID(svc.ID), nil)
+		setCell(a.table, row, 3, relativeAge(svc.Meta.CreatedAt), nil)
+		setCell(a.table, row, 4, image, nil)
+		setCell(a.table, row, 5, stack, nil)
+		setCell(a.table, row, 6, dockerx.ShortID(svc.ID), nil)
 		row++
 	}
 	a.setStatus(fmt.Sprintf("%d services", len(services)))
@@ -223,7 +260,7 @@ func (a *App) refreshContainers() error {
 		return err
 	}
 
-	setHeaderRow(a.table, "NAME", "SERVICE", "NODE", "STATE", "IMAGE", "ID")
+	setHeaderRow(a.table, "NAME", "SERVICE", "NODE", "STATE", "AGE", "IMAGE", "ID")
 	row := 1
 	for _, t := range tasks {
 		if !rowMatchesFilter(a.filterText, t.Name, t.ServiceName, t.NodeName, t.State, t.Image) {
@@ -241,7 +278,7 @@ func (a *App) refreshContainers() error {
 			nodeAddr:    t.NodeAddr,
 		}
 		color := taskStateColor(t.State)
-		values := []string{t.Name, t.ServiceName, t.NodeName, t.State, t.Image, dockerx.ShortID(t.ID)}
+		values := []string{t.Name, t.ServiceName, t.NodeName, t.State, relativeAge(t.CreatedAt), t.Image, dockerx.ShortID(t.ID)}
 		for col, v := range values {
 			cell := tview.NewTableCell(v).SetTextColor(color)
 			if col == 0 {
