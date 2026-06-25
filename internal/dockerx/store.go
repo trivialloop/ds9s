@@ -386,6 +386,18 @@ func (s *Store) ServiceLogs(ctx context.Context, serviceID string, follow bool) 
 	})
 }
 
+// TaskLogs streams logs for one specific Swarm task (replica) through the
+// manager. Unlike ServiceLogs, this shows output from one container only.
+func (s *Store) TaskLogs(ctx context.Context, taskID string, follow bool) (io.ReadCloser, error) {
+	return s.conn.Client.TaskLogs(ctx, taskID, types.ContainerLogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Follow:     follow,
+		Tail:       "200",
+		Timestamps: true,
+	})
+}
+
 // ServiceTaskContainerIDs returns the container IDs of all currently running
 // tasks for a service, used to fan out / aggregate "service logs".
 func (s *Store) ServiceTaskContainerIDs(ctx context.Context, serviceID string) ([]string, error) {
