@@ -279,12 +279,8 @@ func (a *App) handleLogs() {
 
 	switch ref.kind {
 	case viewContainers:
-		// Tasks view: stream via the parent service (works across all nodes).
-		if ref.serviceID == "" {
-			a.setStatus("[yellow]no service associated with this task")
-			return
-		}
-		a.streamServiceLogs(ref.name, []string{ref.serviceID})
+		// Stream logs from the specific task (replica), not the whole service.
+		a.streamTaskLogs(ref.name, ref.id)
 	case viewServices:
 		// Use ServiceLogs: the manager aggregates logs from all task replicas,
 		// even those running on worker nodes the client cannot reach directly.
@@ -480,6 +476,41 @@ func (a *App) tailOneService(ctx context.Context, view *tview.TextView, serviceI
 		default:
 		}
 		a.tv.QueueUpdateDraw(func() { fmt.Fprintf(view, "%s%s\n", prefix, line) })
+	}
+}
+
+// streamTaskLogs tails logs from one specific Swarm task (single replica).
+func (a *App) streamTaskLogs(title string, taskID string) {
+	view, ctx, _ := a.openLogView(title)
+	go a.tailOneTask(ctx, view, taskID)
+}
+
+func (a *App) tailOneTask(ctx context.Context, view *tview.TextView, taskID string) {
+	rc, err := a.store.TaskLogs(ctx, taskID, true)
+	if err != nil {
+		a.tv.QueueUpdateDraw(func() {
+			fmt.Fprintf(view, "[error opening task logs for %s: %v]\n", taskID[:min(12, len(taskID))], err)
+		})
+		return
+	}
+	defer rc.Close()
+
+	pr, pw := io.Pipe()
+	go func() {
+		defer pw.Close()
+		_, _ = stdcopy.StdCopy(pw, pw, rc)
+	}()
+
+	scanner := bufio.NewScanner(pr)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		a.tv.QueueUpdateDraw(func() { fmt.Fprintf(view, "%s\n", line) })
 	}
 }
 
