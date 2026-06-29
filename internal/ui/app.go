@@ -410,8 +410,8 @@ func (a *App) updateHints() {
 			filterLabel = "ALL"
 		}
 		extra = chip("Enter", "LOGS") + "   " + chip("d", "DESCRIBE") + "   " +
-			chip("s", "SHELL") + "   " + chip("k", "KILL") + "   " +
-			chip("l", "LOGS") + "   " + chip("f", filterLabel)
+			chip("s", "SHELL") + "   " + chip("k", "STOP") + "   " +
+			chip("Ctrl-D", "KILL") + "   " + chip("l", "LOGS") + "   " + chip("f", filterLabel)
 	case viewStacks:
 		extra = chip("Enter", "SERVICES") + "   " + chip("e", "EDIT") + "   " +
 			chip("l", "LOGS") + "   " + chip("Ctrl-D", "DELETE")
