@@ -115,6 +115,20 @@ func (a *App) handleDelete() {
 	if ref == nil {
 		return
 	}
+	// Containers: Ctrl-D sends SIGKILL (not rm -f). Handle before the generic
+	// confirm so there is only one dialog, not two nested ones.
+	if ref.kind == viewContainers {
+		if ref.containerID == "" {
+			a.setStatus("[red]container ID not available (task not yet running)")
+			return
+		}
+		a.confirm(fmt.Sprintf("Force-kill %q with SIGKILL?\n(Swarm will restart it automatically)", ref.name), func() {
+			a.setStatus(fmt.Sprintf("Sending SIGKILL to %s…", ref.name))
+			go a.doSignal(ref.containerID, ref.nodeAddr, ref.nodeName, ref.name, "SIGKILL")
+		})
+		return
+	}
+
 	a.confirm(fmt.Sprintf("Delete %s %q?", ref.kind, ref.name), func() {
 		ctx, cancel := a.ctx()
 		defer cancel()
@@ -122,28 +136,6 @@ func (a *App) handleDelete() {
 		switch ref.kind {
 		case viewServices:
 			err = a.store.RemoveService(ctx, ref.id)
-		case viewContainers:
-			if ref.containerID == "" {
-				err = fmt.Errorf("container ID not available (task not yet running)")
-				break
-			}
-			sshTarget := ref.nodeAddr
-			if sshTarget == "" {
-				sshTarget = ref.nodeName
-			}
-			if a.conn.Manager.SSH == nil && sshTarget != "" {
-				err = fmt.Errorf("container is on node %s — add an ssh: block to this manager in ds9s config for cross-node delete", sshTarget)
-			} else if a.conn.Manager.SSH != nil && sshTarget != "" {
-				// SSH path: mirror the kill mechanism — remote docker rm -f on the node that owns the container.
-				rmCmd := "docker rm -f " + ref.containerID
-				if a.conn.Manager.SSH.Sudo {
-					rmCmd = "sudo -n " + rmCmd
-				}
-				_, err = dockerx.RunCommandOnNode(*a.conn.Manager.SSH, sshTarget, rmCmd)
-			} else {
-				// Manager-local container (or task not yet assigned): use the Docker API.
-				err = a.store.RemoveContainer(ctx, ref.containerID, true)
-			}
 		case viewStacks:
 			if errs := a.store.RemoveStack(ctx, ref.id); len(errs) > 0 {
 				err = errs[0]
@@ -779,73 +771,102 @@ func (a *App) handleKill() {
 		a.setStatus("[red]container ID not available")
 		return
 	}
-	// Use Swarm advertise IP (nodeAddr) — more reliable for SSH than OS hostname.
-	sshTarget := ref.nodeAddr
-	if sshTarget == "" {
-		sshTarget = ref.nodeName
-	}
-	a.confirm(fmt.Sprintf("Kill container %q with SIGKILL?\n(Swarm will restart it automatically)", ref.name), func() {
-		a.setStatus(fmt.Sprintf("Killing %s on %s…", ref.containerID[:min(12, len(ref.containerID))], sshTarget))
-		go a.doKill(ref.containerID, sshTarget, ref.name)
+	a.confirm(fmt.Sprintf("Stop %q gracefully?\n(SIGTERM, then SIGKILL after 10s — Swarm will restart it)", ref.name), func() {
+		a.setStatus(fmt.Sprintf("Stopping %s…", ref.name))
+		go a.doStop(ref.containerID, ref.nodeAddr, ref.nodeName, ref.name)
 	})
 }
 
-func (a *App) doKill(containerID, sshTarget, displayName string) {
-	// No SSH config but the container is on a worker: the Docker API only
-	// reaches the manager's local containers — show a clear message instead of
-	// the confusing "No such container" error from the manager's daemon.
-	if a.conn.Manager.SSH == nil && sshTarget != "" {
-		a.tv.QueueUpdateDraw(func() {
-			msg := fmt.Sprintf(
-				"[red]Cannot kill cross-node container[-]\n\n"+
-					"[yellow]%s[-] is on node [yellow]%s[-].\n\n"+
-					"The Docker API only reaches containers on the manager node.\n"+
-					"Add an [white]ssh:[-] section to this manager in ds9s config\n"+
-					"to enable SSH-based kill on worker nodes.\n\n"+
-					"[grey]Press Esc or Enter to dismiss[-]",
-				displayName, sshTarget)
-			a.showInfoPage("kill-error", " Kill Error ", msg)
-		})
-		return
+// doStop sends a graceful stop (SIGTERM → wait 10s → SIGKILL) to a container.
+func (a *App) doStop(containerID, nodeAddr, nodeName, displayName string) {
+	sshTarget := nodeAddr
+	if sshTarget == "" {
+		sshTarget = nodeName
 	}
 
 	var (
-		killErr    error
-		killMethod string
+		stopErr   error
+		stopMethod string
 		remoteCmd  string
 	)
 
 	if a.conn.Manager.SSH != nil && sshTarget != "" {
-		// SSH path: exactly the same mechanism as handleShell — SSH to the node
-		// that owns the container, then run docker kill with the full container ID.
-		killMethod = "SSH → " + sshTarget
+		stopMethod = "SSH → " + sshTarget
+		remoteCmd = "docker stop " + containerID
+		if a.conn.Manager.SSH.Sudo {
+			remoteCmd = "sudo -n " + remoteCmd
+		}
+		_, stopErr = dockerx.RunCommandOnNode(*a.conn.Manager.SSH, sshTarget, remoteCmd)
+	} else {
+		stopMethod = "Docker API (manager)"
+		ctx, cancel := a.ctx()
+		defer cancel()
+		stopErr = a.store.StopContainer(ctx, containerID, 10)
+	}
+
+	a.tv.QueueUpdateDraw(func() {
+		if stopErr != nil {
+			hint := ""
+			if sshTarget == "" {
+				hint = "\n\n[grey]Tip: node address unknown — task may still be starting[-]"
+			} else if a.conn.Manager.SSH == nil {
+				hint = fmt.Sprintf(
+					"\n\n[grey]%s is on node %s.\nAdd an [white]ssh:[-][grey] block to this manager in ds9s config\nto enable cross-node stop.[-]",
+					displayName, sshTarget)
+			}
+			msg := fmt.Sprintf(
+				"[red]stop failed[-]  (via %s)\n\n[white]%v[-]%s\n\n[grey]Press Esc or Enter to dismiss[-]",
+				stopMethod, stopErr, hint)
+			a.showInfoPage("kill-error", " Stop Error ", msg)
+		} else {
+			a.setStatus(fmt.Sprintf("[green]stopped %s", displayName))
+		}
+	})
+}
+
+// doSignal sends SIGKILL to a container (Ctrl-D path).
+func (a *App) doSignal(containerID, nodeAddr, nodeName, displayName, signal string) {
+	sshTarget := nodeAddr
+	if sshTarget == "" {
+		sshTarget = nodeName
+	}
+
+	var (
+		sigErr    error
+		sigMethod string
+		remoteCmd string
+	)
+
+	if a.conn.Manager.SSH != nil && sshTarget != "" {
+		sigMethod = "SSH → " + sshTarget
 		remoteCmd = "docker kill " + containerID
 		if a.conn.Manager.SSH.Sudo {
 			remoteCmd = "sudo -n " + remoteCmd
 		}
-		_, killErr = dockerx.RunCommandOnNode(*a.conn.Manager.SSH, sshTarget, remoteCmd)
+		_, sigErr = dockerx.RunCommandOnNode(*a.conn.Manager.SSH, sshTarget, remoteCmd)
 	} else {
-		// Docker API path: works for containers on the manager node only.
-		// sshTarget is empty (task not yet assigned to a node) or SSH is nil
-		// but we already handled the SSH-nil+sshTarget case above.
-		killMethod = "Docker API (manager)"
+		sigMethod = "Docker API (manager)"
 		ctx, cancel := a.ctx()
 		defer cancel()
-		killErr = a.store.KillContainer(ctx, containerID)
+		sigErr = a.store.KillContainer(ctx, containerID)
 	}
 
 	a.tv.QueueUpdateDraw(func() {
-		if killErr != nil {
+		if sigErr != nil {
 			hint := ""
 			if sshTarget == "" {
-				hint = "\n\n[grey]Tip: node address is unknown — the task may still be starting[-]"
+				hint = "\n\n[grey]Tip: node address unknown — task may still be starting[-]"
+			} else if a.conn.Manager.SSH == nil {
+				hint = fmt.Sprintf(
+					"\n\n[grey]%s is on node %s.\nAdd an [white]ssh:[-][grey] block to this manager in ds9s config\nto enable cross-node kill.[-]",
+					displayName, sshTarget)
 			}
 			msg := fmt.Sprintf(
-				"[red]Kill failed[-]  (via %s)\n[grey]Command: %s[-]\n\n[white]%v[-]%s\n\n[grey]Press Esc or Enter to dismiss[-]",
-				killMethod, remoteCmd, killErr, hint)
-			a.showInfoPage("kill-error", " Kill Error ", msg)
+				"[red]%s failed[-]  (via %s)\n\n[white]%v[-]%s\n\n[grey]Press Esc or Enter to dismiss[-]",
+				signal, sigMethod, sigErr, hint)
+			a.showInfoPage("kill-error", " Signal Error ", msg)
 		} else {
-			a.setStatus(fmt.Sprintf("[green]killed %s", displayName))
+			a.setStatus(fmt.Sprintf("[green]%s → %s", signal, displayName))
 		}
 	})
 }

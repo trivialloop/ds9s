@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/swarm"
 	"github.com/docker/docker/api/types/volume"
@@ -654,8 +655,19 @@ func (s *Store) AllNodeNetworks(ctx context.Context) ([]NodeNetworkInfo, []error
 
 // --- Container kill ----------------------------------------------------------
 
-// KillContainer sends SIGKILL to a container running on the manager node.
-// For containers on worker nodes, use BuildSSHCmd + remote docker kill instead.
+// StopContainer sends SIGTERM to a container and waits up to timeoutSec for
+// it to exit; if still running after the timeout, Docker sends SIGKILL.
+// Use this for graceful stop (k key). For worker nodes, use SSH instead.
+func (s *Store) StopContainer(ctx context.Context, containerID string, timeoutSec int) error {
+	opts := container.StopOptions{Timeout: &timeoutSec}
+	if err := s.conn.Client.ContainerStop(ctx, containerID, opts); err != nil {
+		return fmt.Errorf("stopping container: %w", err)
+	}
+	return nil
+}
+
+// KillContainer sends SIGKILL to a container on the manager node.
+// For worker nodes, use SSH instead.
 func (s *Store) KillContainer(ctx context.Context, containerID string) error {
 	if err := s.conn.Client.ContainerKill(ctx, containerID, "SIGKILL"); err != nil {
 		return fmt.Errorf("killing container: %w", err)
